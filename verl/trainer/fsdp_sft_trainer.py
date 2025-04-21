@@ -18,6 +18,7 @@ TODO(zhangchi.usc1992)
 - Add validation
 """
 
+from collections import defaultdict
 import os
 
 os.environ['NCCL_DEBUG'] = 'WARN'
@@ -52,6 +53,11 @@ from peft import LoraConfig, TaskType, get_peft_model
 from verl.workers.sharding_manager import FSDPUlyssesShardingManager
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl import DataProto
+
+import importlib
+from typing import Optional, Callable
+
+from verl.utils.reward_score import _default_compute_score
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
@@ -181,6 +187,39 @@ class FSDPSFTTrainer(object):
                                          num_workers=8,
                                          pin_memory=True,
                                          drop_last=True)
+
+    def get_custom_reward_fn(self, config):
+        """Load a custom reward function from the specified path and name."""
+        reward_fn_config = config.get("custom_reward_function") or {}
+        file_path = reward_fn_config.get("path")
+        if not file_path:
+            return None
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Reward function file '{file_path}' not found.")
+
+        spec = importlib.util.spec_from_file_location("custom_module", file_path)
+        module = importlib.util.module_from_spec(spec)
+        try:
+            import sys
+            sys.modules["custom_module"] = module
+            spec.loader.exec_module(module)
+        except Exception as e:
+            raise RuntimeError(f"Error loading module from '{file_path}': {e}")
+
+        function_name = reward_fn_config.get("name", "compute_score")
+        if not hasattr(module, function_name):
+            raise AttributeError(f"Reward function '{function_name}' not found in '{file_path}'.")
+
+        print(f"Using customized reward function '{function_name}' from '{file_path}'")
+        raw_fn = getattr(module, function_name)
+
+        reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
+
+        def wrapped_fn(*args, **kwargs):
+            return raw_fn(*args, **kwargs, **reward_kwargs)
+
+        return wrapped_fn
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -384,6 +423,120 @@ class FSDPSFTTrainer(object):
                     loss.backward()
                 return loss
 
+    def _generate_validation_responses(self, batch, num_samples=1):
+        """Generate responses for validation data using the current model."""
+        self.fsdp_model.eval()
+        input_ids = batch['input_ids'].cuda()
+        attention_mask = batch['attention_mask'].cuda()
+        
+        # Find prompt lengths (non-padding tokens before the loss mask starts)
+        if 'loss_mask' in batch:
+            breakpoint()
+            loss_starts = batch['loss_mask'].nonzero(as_tuple=True)[1]
+            prompt_lengths = loss_starts.reshape(input_ids.shape[0], -1)[:,0]
+        else:
+            # Default to half of the sequence if loss_mask not provided
+            prompt_lengths = torch.tensor([input_ids.shape[1] // 2] * input_ids.shape[0])
+        
+        with torch.no_grad():
+            # Extract prompts
+            prompts = []
+            for i, length in enumerate(prompt_lengths):
+                prompt = input_ids[i, :length].unsqueeze(0)
+                prompts.append(prompt)
+                
+            all_responses = []
+            for prompt in prompts:
+                # Generate response with the model
+                gen_output = self.fsdp_model.generate(
+                    prompt, 
+                    max_new_tokens=self.config.data.max_response_length,
+                    do_sample=True,
+                    top_p=0.9,
+                    temperature=0.7,
+                    num_return_sequences=num_samples
+                )
+                responses = gen_output[:, prompt.shape[1]:]  # Remove prompt tokens
+                all_responses.append(responses)
+                
+            return prompts, all_responses
+
+    def compute_reward_scores(self, prompts, responses, data_sources, ground_truths, extra_infos=None, compute_score=None):
+        """Compute reward scores for generated responses using specified reward function."""
+        if compute_score is None:
+            compute_score = _default_compute_score
+            
+        # Decode all sequences
+        prompt_strs = [self.tokenizer.decode(p[0], skip_special_tokens=True) for p in prompts]
+        response_strs = []
+        for resp_batch in responses:
+            decoded = [self.tokenizer.decode(r, skip_special_tokens=True) for r in resp_batch]
+            response_strs.append(decoded)
+        
+        # Compute scores
+        try:
+            scores = []
+            for i, (prompt, resps, data_source, ground_truth) in enumerate(zip(prompt_strs, response_strs, data_sources, ground_truths)):
+                batch_scores = []
+                extra_info = None if extra_infos is None else extra_infos[i]
+                for resp in resps:
+                    score = compute_score(data_source, resp, ground_truth, extra_info)
+                    if isinstance(score, dict):
+                        score = score.get("score", 0.0)
+                    batch_scores.append(float(score))
+                scores.append(batch_scores)
+            return scores
+        except Exception as e:
+            print(f"Error computing reward scores: {e}")
+            return [[0.0] * len(resp_batch) for resp_batch in response_strs]
+            
+    def validate_with_reward(self, dataloader, compute_score=None, num_samples=1):
+        """Validate the model using reward functions on generated responses."""
+        self.fsdp_model.eval()
+        reward_scores = []
+        data_counts = defaultdict(int)
+        data_scores = defaultdict(list)
+        
+        for i, data in enumerate(tqdm(dataloader, desc="Validating with rewards")):
+            if i >= self.config.trainer.get('val_batches_limit', float('inf')):
+                break
+                
+            # Extract data source and ground truth
+            data_sources = data.get('data_source', ['default'] * data['input_ids'].shape[0])
+            ground_truths = data.get('ground_truth', [''] * data['input_ids'].shape[0])
+            extra_infos = data.get('extra_info', None)
+            
+            # Generate responses
+            prompts, responses = self._generate_validation_responses(data, num_samples)
+            
+            # Compute scores
+            batch_scores = self.compute_reward_scores(
+                prompts, responses, data_sources, ground_truths, 
+                extra_infos, compute_score
+            )
+            
+            # Track scores by data source
+            for ds, scores in zip(data_sources, batch_scores):
+                data_counts[ds] += 1
+                # Use best score from generated samples
+                data_scores[ds].append(max(scores) if scores else 0.0)
+            
+            reward_scores.extend(batch_scores)
+        
+        # Calculate average scores by data source
+        metrics = {}
+        for ds, scores in data_scores.items():
+            if scores:
+                metrics[f'val/reward/{ds}/mean'] = sum(scores) / len(scores)
+                metrics[f'val/reward/{ds}/count'] = len(scores)
+        
+        # Overall average
+        all_scores = [score for batch in reward_scores for score in batch]
+        if all_scores:
+            metrics['val/reward/overall'] = sum(all_scores) / len(all_scores)
+        
+        return metrics
+
     def training_step(self, batch: TensorDict):
         self.fsdp_model.train()
 
@@ -458,6 +611,9 @@ class FSDPSFTTrainer(object):
                                 experiment_name=self.config.trainer.experiment_name,
                                 default_backend=self.config.trainer.logger)
 
+        # Load custom reward function if configured
+        compute_score = self.get_custom_reward_fn(self.config) or _default_compute_score
+
         global_step = 0
         # compute the total training steps.
         # the total training steps in SFT is mainly for early exit
@@ -468,8 +624,15 @@ class FSDPSFTTrainer(object):
 
         self.total_training_steps = total_training_steps
         print(f'Total training steps: {self.total_training_steps}')
-
-        # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.
+        
+        # Get validation frequency in steps
+        val_freq_steps = self.config.trainer.get('val_freq_steps', None)
+        
+        # Check if we should perform initial validation
+        if self.config.trainer.get('val_before_train', False) and rank == 0:
+            metrics = self._perform_validation(compute_score=compute_score)
+            tracking.log(data=metrics, step=global_step)
+            torch.distributed.barrier()
 
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
@@ -482,38 +645,59 @@ class FSDPSFTTrainer(object):
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
 
+                # Check if we should perform step-based validation
+                if val_freq_steps and global_step % val_freq_steps == 0 and rank == 0:
+                    metrics = self._perform_validation(compute_score=compute_score)
+                    tracking.log(data=metrics, step=global_step)
+                    torch.distributed.barrier()
+
                 # for early exit validation
                 if global_step >= self.total_training_steps:
                     # Perform final validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
                     if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {'val/loss': avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
+                        metrics = self._perform_validation(compute_score=compute_score)
+                        tracking.log(data=metrics, step=global_step)
                     torch.distributed.barrier()
 
                     # Save final checkpoint
                     self.save_checkpoint(step=global_step)
                     return
 
-            # validation
-            val_losses = []
-            for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
+            # End-of-epoch validation
             if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {'val/loss': val_loss.detach().item()}
-                tracking.log(data=metric, step=global_step)
+                metrics = self._perform_validation(
+                    compute_score=compute_score,
+                    use_reward=self.config.trainer.get('use_reward_validation', False) and 
+                              (epoch + 1) % self.config.trainer.get('reward_val_freq', 1) == 0
+                )
+                tracking.log(data=metrics, step=global_step)
             torch.distributed.barrier()
 
             # save checkpoint
             self.save_checkpoint(step=global_step)
+
+    def _perform_validation(self, compute_score=None, use_reward=True):
+        """Perform both perplexity-based and reward-based validation."""
+        # Collect perplexity metrics
+        val_losses = []
+        for data in self.val_dataloader:
+            data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+            val_loss = self.validation_step(data)
+            val_losses.append(val_loss)
+        
+        avg_val_loss = torch.mean(torch.stack(val_losses))
+        metrics = {'val/loss': avg_val_loss.detach().item()}
+        
+        # Add reward-based validation if enabled
+        if use_reward and self.config.trainer.get('use_reward_validation', False):
+            reward_metrics = self.validate_with_reward(
+                self.val_dataloader,
+                compute_score=compute_score,
+                num_samples=self.config.trainer.get('val_num_samples', 1)
+            )
+            metrics.update(reward_metrics)
+            
+        return metrics
 
 
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
@@ -524,7 +708,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from verl.utils.distributed import initialize_global_process_group
 
 
-@hydra.main(config_path='config', config_name='sft_trainer', version_base=None)
+@hydra.main(config_path='config', config_name='sft_trainer_with_reward_val', version_base=None)
 def main(config):
     local_rank, rank, world_size = initialize_global_process_group()
 

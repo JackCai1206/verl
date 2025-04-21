@@ -1,0 +1,25 @@
+defaults:
+  - sft_trainer
+
+trainer:
+  # Enable reward-based validation
+  use_reward_validation: true
+  # How often to run reward validation (every N epochs)
+  reward_val_freq: 1
+  # Run validation before training starts
+  val_before_train: true
+  # Run validation every N steps
+  val_freq_steps: 100
+  # Number of samples to generate for each validation prompt
+  val_num_samples: 4
+  # Maximum number of validation batches to process (for faster validation)
+  val_batches_limit: 10
+
+# Custom reward function configuration
+custom_reward_function:
+  path: null
+  name: "compute_score"
+  reward_kwargs:
+    method: "flexible"
+    format_score: 0.1
+    score: 1.0

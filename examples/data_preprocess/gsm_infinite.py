@@ -10,43 +10,36 @@ import argparse
 # ...
 
 def extract_solution(solution_str):
-    solution = re.search("ANSWER:\n(\\-?[0-9\\.\\,]+)", solution_str)
+    solution = re.search(r"ANSWER:\s*\n(.*?)(?:\n|$)", solution_str, re.IGNORECASE)
     assert solution is not None
     final_solution = solution.group(0)
-    final_solution = final_solution.split('ANSWER:\n')[1].replace(',', '')
+    final_solution = final_solution.split('ANSWER:\n')[1].replace(',', '').strip()
     return final_solution
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--local_dir', default='/staging/zcai75/datasets/igsm')
+    parser.add_argument('--local_dir', default='~/Jack/datasets/igsm')
     parser.add_argument('--hdfs_dir', default=None)
 
     args = parser.parse_args()
 
     data_source = 'jackcai1206/gsm_infinite_symbolic_0'
 
-    for round in range(1, 3):
-        dataset = datasets.interleave_datasets([datasets.load_dataset(data_source, split=f'ops_{n}') for n in range(round, 5 + round)])
+    ds = datasets.load_dataset(data_source)
+    
+    for round in range(1, 5):
+        dataset = datasets.interleave_datasets([ds[f'ops_{n}'] for n in range(round, 5 + round)], seed=42)
 
         train_dataset, test_dataset = dataset.train_test_split(test_size=0.1).values()
-        
-        instruction_following = "Let's think step by step and output the final answer after \"####\"."
 
         def make_map_fn(split):
 
             def process_fn(example, idx):
-                question_raw = example.pop('question')
-
-                question = question_raw + ' ' + instruction_following
-
-                answer_raw = example.pop('answer')
-                solution = extract_solution(answer_raw)
+                solution = extract_solution(example['solution'])
+                full_question = example['messages'][0]['content']
                 data = {
                     "data_source": data_source,
-                    "prompt": [{
-                        "role": "user",
-                        "content": question,
-                    }],
+                    "prompt": example.pop('messages'),
                     "ability": "math",
                     "reward_model": {
                         "style": "rule",
@@ -55,9 +48,9 @@ if __name__ == '__main__':
                     "extra_info": {
                         'split': split,
                         'index': idx,
-                        'answer': answer_raw,
-                        "question": question_raw,
-                    }
+                        'full_question': full_question,
+                        'full_solution': example['solution']
+                    },
                 }
                 return data
 
@@ -74,6 +67,6 @@ if __name__ == '__main__':
         train_dataset.to_parquet(os.path.join(local_dir, f'train_{round}.parquet'))
         test_dataset.to_parquet(os.path.join(local_dir, f'test_{round}.parquet'))
 
-        makedirs(hdfs_dir)
-
-        copy(src=local_dir, dst=hdfs_dir)
+        if hdfs_dir is not None:    
+            makedirs(hdfs_dir)
+            copy(src=local_dir, dst=hdfs_dir)
