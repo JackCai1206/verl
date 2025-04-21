@@ -23,7 +23,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    data_source = 'InfiniAILab/gsm_infinite_symbolic_0'
+    data_source = 'jackcai1206/gsm_infinite_symbolic_0'
 
     dataset = datasets.interleave_datasets([datasets.load_dataset(data_source, split=f'ops_{n}') for n in range(1, 5)])
 
