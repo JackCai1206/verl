@@ -10,10 +10,15 @@ trainer:
   val_before_train: true
   # Run validation every N steps
   val_freq_steps: 100
-  # Number of samples to generate for each validation prompt
-  val_num_samples: 4
   # Maximum number of validation batches to process (for faster validation)
   val_batches_limit: 10
+rollout:
+  # sampling parameters for validation
+  top_k: -1 # 0 for hf rollout, -1 for vllm rollout
+  top_p: 1.0
+  temperature: 0
+  n: 1
+  do_sample: False # default eager for validation
 
 # Custom reward function configuration
 custom_reward_function:

@@ -31,6 +31,7 @@ import torch
 import torch.distributed
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, CPUOffload
+from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, AutoConfig
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup
@@ -423,43 +424,52 @@ class FSDPSFTTrainer(object):
                     loss.backward()
                 return loss
 
-    def _generate_validation_responses(self, batch, num_samples=1):
-        """Generate responses for validation data using the current model."""
+    def _generate_validation_responses(self, batch):
+        """Generate responses for validation data in one batch, with fast left‑padding."""
         self.fsdp_model.eval()
         input_ids = batch['input_ids'].cuda()
-        attention_mask = batch['attention_mask'].cuda()
-        
-        # Find prompt lengths (non-padding tokens before the loss mask starts)
+
+        # 1) Prompt lengths
         if 'loss_mask' in batch:
-            breakpoint()
-            loss_starts = batch['loss_mask'].nonzero(as_tuple=True)[1]
-            prompt_lengths = loss_starts.reshape(input_ids.shape[0], -1)[:,0]
+            prompt_lengths = torch.argmax(batch['loss_mask'], dim=-1)
         else:
-            # Default to half of the sequence if loss_mask not provided
-            prompt_lengths = torch.tensor([input_ids.shape[1] // 2] * input_ids.shape[0])
-        
-        with torch.no_grad():
-            # Extract prompts
-            prompts = []
-            for i, length in enumerate(prompt_lengths):
-                prompt = input_ids[i, :length].unsqueeze(0)
-                prompts.append(prompt)
-                
-            all_responses = []
-            for prompt in prompts:
-                # Generate response with the model
-                gen_output = self.fsdp_model.generate(
-                    prompt, 
-                    max_new_tokens=self.config.data.max_response_length,
-                    do_sample=True,
-                    top_p=0.9,
-                    temperature=0.7,
-                    num_return_sequences=num_samples
-                )
-                responses = gen_output[:, prompt.shape[1]:]  # Remove prompt tokens
-                all_responses.append(responses)
-                
-            return prompts, all_responses
+            prompt_lengths = torch.full(
+                (input_ids.size(0),),
+                input_ids.size(1),
+                device=input_ids.device,
+                dtype=torch.long
+            )
+
+        # 2) Extract raw prompts (no padding)
+        prompts = [input_ids[i, :L] for i, L in enumerate(prompt_lengths)]
+
+        # 3) Reverse + pad_sequence + flip back for left-padding
+        pad_id = self.tokenizer.pad_token_id
+        prompts_rev = [p.flip(0) for p in prompts]
+        padded_rev  = pad_sequence(prompts_rev, batch_first=True, padding_value=pad_id)
+        input_ids_prompt = padded_rev.flip(1)    # now left-padded
+        attention_mask   = (input_ids_prompt != pad_id).long()
+
+        # 4) One-shot generation
+        with torch.amp.autocast(device_type="cuda"), FSDP.summon_full_params(self.fsdp_model), torch.no_grad():
+            gen_output = self.fsdp_model.generate(
+                input_ids=input_ids_prompt,
+                attention_mask=attention_mask,
+                max_new_tokens=self.config.data.max_length,
+                do_sample=self.config.rollout.do_sample,
+                top_p=self.config.rollout.top_p,
+                top_k=self.config.rollout.top_k,
+                temperature=self.config.rollout.temperature,
+                num_return_sequences=self.config.rollout.n,
+            )
+
+        # 5) Reshape & strip off the full prompt
+        B, P = input_ids_prompt.size()
+        gen_output = gen_output.view(B, self.config.rollout.n, -1)
+        all_responses = gen_output[:, :, P:]     # only the new tokens
+
+        return input_ids_prompt, all_responses
+
 
     def compute_reward_scores(self, prompts, responses, data_sources, ground_truths, extra_infos=None, compute_score=None):
         """Compute reward scores for generated responses using specified reward function."""
@@ -490,7 +500,7 @@ class FSDPSFTTrainer(object):
             print(f"Error computing reward scores: {e}")
             return [[0.0] * len(resp_batch) for resp_batch in response_strs]
             
-    def validate_with_reward(self, dataloader, compute_score=None, num_samples=1):
+    def validate_with_reward(self, dataloader, compute_score=None):
         """Validate the model using reward functions on generated responses."""
         self.fsdp_model.eval()
         reward_scores = []
@@ -507,7 +517,7 @@ class FSDPSFTTrainer(object):
             extra_infos = data.get('extra_info', None)
             
             # Generate responses
-            prompts, responses = self._generate_validation_responses(data, num_samples)
+            prompts, responses = self._generate_validation_responses(data)
             
             # Compute scores
             batch_scores = self.compute_reward_scores(
@@ -692,8 +702,7 @@ class FSDPSFTTrainer(object):
         if use_reward and self.config.trainer.get('use_reward_validation', False):
             reward_metrics = self.validate_with_reward(
                 self.val_dataloader,
-                compute_score=compute_score,
-                num_samples=self.config.trainer.get('val_num_samples', 1)
+                compute_score=compute_score
             )
             metrics.update(reward_metrics)
             
