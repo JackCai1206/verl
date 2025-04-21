@@ -25,54 +25,55 @@ if __name__ == '__main__':
 
     data_source = 'jackcai1206/gsm_infinite_symbolic_0'
 
-    dataset = datasets.interleave_datasets([datasets.load_dataset(data_source, split=f'ops_{n}') for n in range(1, 5)])
+    for round in range(1, 3):
+        dataset = datasets.interleave_datasets([datasets.load_dataset(data_source, split=f'ops_{n}') for n in range(round, 5 + round)])
 
-    train_dataset, test_dataset = dataset.train_test_split(test_size=0.1).values()
-    
-    instruction_following = "Let's think step by step and output the final answer after \"####\"."
+        train_dataset, test_dataset = dataset.train_test_split(test_size=0.1).values()
+        
+        instruction_following = "Let's think step by step and output the final answer after \"####\"."
 
-    def make_map_fn(split):
+        def make_map_fn(split):
 
-        def process_fn(example, idx):
-            question_raw = example.pop('question')
+            def process_fn(example, idx):
+                question_raw = example.pop('question')
 
-            question = question_raw + ' ' + instruction_following
+                question = question_raw + ' ' + instruction_following
 
-            answer_raw = example.pop('answer')
-            solution = extract_solution(answer_raw)
-            data = {
-                "data_source": data_source,
-                "prompt": [{
-                    "role": "user",
-                    "content": question,
-                }],
-                "ability": "math",
-                "reward_model": {
-                    "style": "rule",
-                    "ground_truth": solution
-                },
-                "extra_info": {
-                    'split': split,
-                    'index': idx,
-                    'answer': answer_raw,
-                    "question": question_raw,
+                answer_raw = example.pop('answer')
+                solution = extract_solution(answer_raw)
+                data = {
+                    "data_source": data_source,
+                    "prompt": [{
+                        "role": "user",
+                        "content": question,
+                    }],
+                    "ability": "math",
+                    "reward_model": {
+                        "style": "rule",
+                        "ground_truth": solution
+                    },
+                    "extra_info": {
+                        'split': split,
+                        'index': idx,
+                        'answer': answer_raw,
+                        "question": question_raw,
+                    }
                 }
-            }
-            return data
+                return data
 
-        return process_fn
+            return process_fn
 
-    train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
-    test_dataset = test_dataset.map(function=make_map_fn('test'), with_indices=True)
-    
-    print(train_dataset[0])
+        train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
+        test_dataset = test_dataset.map(function=make_map_fn('test'), with_indices=True)
+        
+        print(train_dataset[0])
 
-    local_dir = args.local_dir
-    hdfs_dir = args.hdfs_dir
+        local_dir = args.local_dir
+        hdfs_dir = args.hdfs_dir
 
-    train_dataset.to_parquet(os.path.join(local_dir, 'train.parquet'))
-    test_dataset.to_parquet(os.path.join(local_dir, 'test.parquet'))
+        train_dataset.to_parquet(os.path.join(local_dir, f'train_{round}.parquet'))
+        test_dataset.to_parquet(os.path.join(local_dir, f'test_{round}.parquet'))
 
-    makedirs(hdfs_dir)
+        makedirs(hdfs_dir)
 
-    copy(src=local_dir, dst=hdfs_dir)
+        copy(src=local_dir, dst=hdfs_dir)

@@ -12,21 +12,26 @@ save_path=$2
 # Shift the arguments so $@ refers to the rest
 shift 2
 
-torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
-     -m verl.trainer.fsdp_sft_trainer \
-    data.train_files=$HOME/Jack/datasets/igsm/train.parquet \
-    data.val_files=$HOME/Jack/datasets/igsm/test.parquet \
-    data.prompt_key=extra_info \
-    data.response_key=extra_info \
-    optim.lr=1e-4 \
-    data.prompt_dict_keys=['full_question'] \
-    +data.response_dict_keys=['full_solution'] \
-    data.micro_batch_size=4 \
-    model.partial_pretrain=Qwen/Qwen2.5-0.5B-Instruct \
-    model.use_liger=True \
-    trainer.default_local_dir=$save_path \
-    trainer.project_name=igsm-sft \
-    trainer.experiment_name=igsm-sft-qwen-2.5-0.5b-instruct-liger \
-    trainer.logger=['console','wandb'] \
-    trainer.default_hdfs_dir=null $@ \
-    use_remove_padding=true
+for round in {1..3}; do
+    experiment_name=igsm-sft-qwen-2.5-0.5b-instruct-liger-round_$round
+
+    torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
+        -m verl.trainer.fsdp_sft_trainer \
+        data.train_files=$HOME/Jack/datasets/igsm/train_$round.parquet \
+        data.val_files=$HOME/Jack/datasets/igsm/test_$round.parquet \
+        data.prompt_key=extra_info \
+        data.response_key=extra_info \
+        optim.lr=1e-4 \
+        data.prompt_dict_keys=['full_question'] \
+        +data.response_dict_keys=['full_solution'] \
+        data.micro_batch_size=4 \
+        model.partial_pretrain=Qwen/Qwen2.5-0.5B-Instruct \
+        model.use_liger=True \
+        trainer.default_local_dir=$experiment_name/$save_path \
+        trainer.project_name=igsm-sft \
+        trainer.experiment_name=$experiment_name \
+        trainer.logger=['console','wandb'] \
+        trainer.default_hdfs_dir=null $@ \
+        trainer.resume_path=$experiment_name/$save_path \
+        use_remove_padding=true
+done
