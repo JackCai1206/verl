@@ -466,6 +466,55 @@ def get_constant_schedule_with_warmup(
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
+def get_wsd_schedule_with_warmup(
+    optimizer: Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    step_size_up: int = 0,
+    step_size_down: int = 0,
+    min_lr_ratio: float = 0.0,
+    last_epoch: int = -1,
+):
+    """
+    Create a schedule with a learning rate that increases during warmup, then decreases in a warm-down phase,
+    then maintains at a constant lower rate.
+
+    Args:
+        optimizer (:class:`~torch.optim.Optimizer`):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (:obj:`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (:obj:`int`):
+            The total number of training steps.
+        step_size_up (:obj:`int`, `optional`, defaults to 0):
+            The duration of the warmup phase.
+        step_size_down (:obj:`int`, `optional`, defaults to 0):
+            The duration of the warm-down phase.
+        min_lr_ratio (:obj:`float`, `optional`, defaults to 0.0):
+            The minimum lr ratio w.r.t the maximum.
+        last_epoch (:obj:`int`, `optional`, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        :obj:`torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    """
+    assert min_lr_ratio >= 0 and min_lr_ratio <= 1.
+    step_size_up = step_size_up if step_size_up > 0 else num_warmup_steps
+    step_size_down = step_size_down if step_size_down > 0 else num_training_steps - num_warmup_steps
+
+    def lr_lambda(current_step):
+        if current_step < step_size_up:
+            # Warmup phase
+            return float(current_step) / float(max(1, step_size_up))
+        elif current_step < (step_size_up + step_size_down):
+            # Warm-down phase
+            progress = float(current_step - step_size_up) / float(max(1, step_size_down))
+            return max(min_lr_ratio, 1.0 - (1.0 - min_lr_ratio) * progress)
+        else:
+            # Constant phase
+            return min_lr_ratio
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 def prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds):
     # create causal mask

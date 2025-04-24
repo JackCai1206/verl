@@ -30,7 +30,7 @@ for round in {1..5}; do
         +data.response_dict_keys=['full_solution'] \
         data.micro_batch_size=4 \
         model.partial_pretrain=$model \
-        model.use_liger=False \
+        model.use_liger=True \
         trainer.default_local_dir=$experiment_name/$save_path \
         trainer.project_name=igsm-sft \
         trainer.experiment_name=$experiment_name \
@@ -38,6 +38,6 @@ for round in {1..5}; do
         trainer.default_hdfs_dir=null $@ \
         trainer.resume_path=$experiment_name/$save_path \
         trainer.val_freq_steps=50 \
-        custom_reward_function.path="/home/ubuntu/Jack/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
+        validation.reward_function.path="/home/ubuntu/Jack/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
         use_remove_padding=false
 done
