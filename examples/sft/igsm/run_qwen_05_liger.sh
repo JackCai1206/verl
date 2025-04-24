@@ -13,8 +13,8 @@ shift 2
 
 export WANDB_MODE="disabled"
 
-model=Qwen/Qwen2.5-0.5B-Instruct
-# model=HuggingFaceTB/SmolLM2-135M-Instruct
+# model=Qwen/Qwen2.5-0.5B-Instruct
+model=HuggingFaceTB/SmolLM2-135M-Instruct
 
 for round in {1..5}; do
     experiment_name=igsm-sft-$model-liger-round_$round
@@ -37,7 +37,7 @@ for round in {1..5}; do
         trainer.logger=['console','wandb'] \
         trainer.default_hdfs_dir=null $@ \
         trainer.resume_path=$experiment_name/$save_path \
-        validation.reward_fn.path="/home/ubuntu/Jack/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
+        validation.reward_fn.path="/home/ubuntu/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
         validation.reward_fn.name="compute_score" \
         use_remove_padding=false
 done
