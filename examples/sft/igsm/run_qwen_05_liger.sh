@@ -39,6 +39,5 @@ for round in {1..5}; do
         trainer.resume_path=$experiment_name/$save_path \
         validation.reward_fn.path="/home/ubuntu/Jack/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
         validation.reward_fn.name="compute_score" \
-        validation.reward_fn.kwargs=null \
         use_remove_padding=false
 done
