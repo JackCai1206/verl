@@ -507,63 +507,12 @@ class FSDPSFTTrainer:
         
         return input_texts, generated_texts
 
-    def compute_metrics(self, generated_outputs):
-        """Compute validation metrics based on generation outputs"""
-        inputs, outputs = generated_outputs
-        
-        # Basic metrics (can be extended with more complex evaluations)
-        metrics = {}
-        
-        # Compute average output length
-        output_lengths = [len(output.split()) for output in outputs]
-        metrics["val/avg_output_length"] = sum(output_lengths) / len(output_lengths)
-        
-        # If reward function configured
-        if hasattr(self.config.validation, "reward_fn") and self.config.validation.reward_fn is not None:
-            # Import the reward function (similar to what's done in ray_trainer)
-            from verl.utils.import_utils import load_extern_type
-            
-            reward_fn_path = self.config.validation.reward_fn.path
-            reward_fn_name = self.config.validation.reward_fn.name
-            reward_fn = load_extern_type(reward_fn_path, reward_fn_name)
-            
-            # Apply the reward function
-            rewards = []
-            reward_extra_infos_dict = defaultdict(list)
-            
-            for input_text, output_text in zip(inputs, outputs):
-                result = reward_fn({"input": input_text, "output": output_text}, 
-                                  return_dict=True, 
-                                  **self.config.validation.reward_fn.get("kwargs", {}))
-                
-                reward_value = result["reward"]
-                rewards.append(reward_value)
-                
-                # Collect additional metrics if available
-                if isinstance(result, dict) and "extra_info" in result:
-                    for key, value in result["extra_info"].items():
-                        reward_extra_infos_dict[key].append(value)
-            
-            # Add rewards to metrics
-            metrics["val/reward_mean"] = sum(rewards) / len(rewards)
-            metrics["val/reward_max"] = max(rewards)
-            metrics["val/reward_min"] = min(rewards)
-            
-            # Add any additional metrics from reward function
-            for key, values in reward_extra_infos_dict.items():
-                if isinstance(values[0], (int, float)):
-                    metrics[f"val/{key}_mean"] = sum(values) / len(values)
-                    metrics[f"val/{key}_max"] = max(values)
-                    metrics[f"val/{key}_min"] = min(values)
-        
-        return metrics
-
     def generate_text(self, input_ids, attention_mask, position_ids=None):
         """Generate text using the model for validation"""
         self.fsdp_model.eval()
         
         # Set generation parameters from config
-        max_length = self.config.validation.max_length
+        max_new_tokens = self.config.validation.max_new_tokens
         do_sample = self.config.validation.get("do_sample", False)
         num_beams = self.config.validation.get("num_beams", 1)
         temperature = self.config.validation.get("temperature", 1.0)
@@ -571,7 +520,7 @@ class FSDPSFTTrainer:
         top_p = self.config.validation.get("top_p", 1.0)
         
         gen_kwargs = {
-            "max_length": max_length,
+            "max_new_tokens": max_new_tokens,
             "num_beams": num_beams,
             "do_sample": do_sample,
             "temperature": temperature,
@@ -581,27 +530,26 @@ class FSDPSFTTrainer:
             "eos_token_id": self.tokenizer.eos_token_id,
         }
         
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             # Move inputs to the correct device
             input_ids = input_ids.to(self.device_mesh.device_type)
             attention_mask = attention_mask.to(self.device_mesh.device_type)
-            
+
             # Optional position_ids
             if position_ids is not None:
                 position_ids = position_ids.to(self.device_mesh.device_type)
+            else:
+                position_ids = None
+            
+            # FSDP summon_full_params context for generation
+            with FSDP.summon_full_params(self.fsdp_model, writeback=False):
                 output_sequences = self.fsdp_model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     **gen_kwargs
                 )
-            else:
-                output_sequences = self.fsdp_model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **gen_kwargs
-                )
-        
+
         # Extract just the generated part (excluding prompt)
         input_length = input_ids.shape[1]
         generated_sequences = output_sequences[:, input_length:]
@@ -640,6 +588,7 @@ class FSDPSFTTrainer:
             raw_prompts = batch["raw_prompt"]
             raw_responses = batch["raw_response"]
             
+            
             # Run generation
             generated_texts = self.generate_text(input_ids, attention_mask, position_ids)
             
@@ -651,9 +600,7 @@ class FSDPSFTTrainer:
             # Compute metrics for each example
             if reward_fn:
                 for prompt, pred, truth in zip(raw_prompts, generated_texts, raw_responses):
-                    result = reward_fn(
-                        {"prompt": prompt, "predicted_response": pred, "ground_truth": truth},
-                        return_dict=True,
+                    result = reward_fn(pred, truth, prompt,
                         **self.config.validation.reward_fn.get("kwargs", {})
                     )
                     all_metrics.append(result)
@@ -827,6 +774,8 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
 from verl.utils.distributed import initialize_global_process_group
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)

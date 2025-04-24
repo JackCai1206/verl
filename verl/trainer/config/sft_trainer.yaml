@@ -50,14 +50,13 @@ validation:
   enable: true  # Whether to enable generation-based validation
   test_freq: 100  # How often to run validation (in steps)
   val_before_train: true  # Whether to run validation before training starts
-  max_length: 512  # Maximum length for generated outputs
+  max_new_tokens: 512  # Maximum length for generated outputs
   num_beams: 1  # Number of beams for beam search
   do_sample: false  # Whether to use sampling
   temperature: 1.0  # Sampling temperature
   top_p: 1.0  # Nucleus sampling parameter
   top_k: 50  # Top-k sampling parameter
-  
-  # For GSM8K dataset, use our math reward function
+
   reward_fn:
     path: "path/to/reward_functions.py"  # Replace with actual path
     name: "gsm8k_reward"  # Use the GSM8K-specific reward function

@@ -37,7 +37,8 @@ for round in {1..5}; do
         trainer.logger=['console','wandb'] \
         trainer.default_hdfs_dir=null $@ \
         trainer.resume_path=$experiment_name/$save_path \
-        trainer.val_freq_steps=50 \
-        validation.reward_function.path="/home/ubuntu/Jack/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
+        validation.reward_fn.path="/home/ubuntu/Jack/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
+        validation.reward_fn.name="compute_score" \
+        validation.reward_fn.kwargs=null \
         use_remove_padding=false
 done
