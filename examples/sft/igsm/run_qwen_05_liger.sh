@@ -18,6 +18,18 @@ model=Qwen/Qwen2.5-0.5B-Instruct
 
 for round in {1..5}; do
     experiment_name=igsm-sft-$model-liger-round_$round
+    if [ "$round" -eq 1 ]; then
+        last_round_name=$model
+    else
+        prev_round=$((round-1))
+        last_round_name=$save_path/igsm-sft-$model-liger-round_$prev_round
+        # Find the latest checkpoint folder with the biggest global step
+        last_round_name=$(find "$last_round_name" -maxdepth 1 -type d -name "global_step_*" | sort -t_ -k3 -n | tail -n 1)
+        if [ -z "$last_round_name" ]; then
+            echo "Error: Could not find checkpoint folder in $last_round_name"
+            exit 1
+        fi
+    fi
 
     # Create the list of test parquet files
     test_files=""
@@ -40,15 +52,15 @@ for round in {1..5}; do
         data.prompt_dict_keys=['full_question'] \
         +data.response_dict_keys=['full_solution'] \
         data.micro_batch_size=4 \
-        model.partial_pretrain=$model \
+        model.partial_pretrain=$last_round_name \
         model.use_liger=True \
         trainer.default_local_dir=$save_path/$experiment_name \
         trainer.project_name=igsm-sft \
         trainer.experiment_name=$experiment_name \
         trainer.logger=['console','wandb'] \
         trainer.default_hdfs_dir=null $@ \
-        trainer.resume_path=$save_path/$experiment_name \
         validation.reward_fn.path="/home/ubuntu/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
         validation.reward_fn.name="compute_score" \
         use_remove_padding=false
 done
+        # trainer.resume_path=$save_path/$experiment_name \

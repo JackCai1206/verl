@@ -49,13 +49,13 @@ validation:
   batch_size: 128  # Batch size for validation
   enable: true  # Whether to enable generation-based validation
   test_freq: 100  # How often to run validation (in steps)
-  val_before_train: true  # Whether to run validation before training starts
-  max_new_tokens: 1024  # Maximum length for generated outputs
+  val_before_train: false  # Whether to run validation before training starts
+  max_new_tokens: 512  # Maximum length for generated outputs
   num_beams: 1  # Number of beams for beam search
   do_sample: true  # Whether to use sampling
-  temperature: 1.0  # Sampling temperature
-  top_p: 1.0  # Nucleus sampling parameter
-  top_k: 50  # Top-k sampling parameter
+  temperature: 0.7  # Sampling temperature
+  top_p: 0.8  # Nucleus sampling parameter
+  top_k: 20  # Top-k sampling parameter
 
   reward_fn:
     path: "path/to/reward_functions.py"  # Replace with actual path
@@ -70,7 +70,7 @@ use_remove_padding: False
 trainer:
   default_local_dir: /tmp/sft_model
   default_hdfs_dir: hdfs://tmp/experiments/gsm8k/gemma-1.1-7b-it/ # change the hdfs path here
-  resume_path: null
+  # resume_path: null
   project_name: gsm8k-sft
   experiment_name: test
   total_epochs: 4
@@ -79,4 +79,4 @@ trainer:
   seed: 1
   # Added for the validation generations visualization
   log_val_generations: 10  # Number of validation examples to log (0 to disable)
-  save_freq: 1000  # How often to save checkpoints (in steps)
+  save_freq: 100  # How often to save checkpoints (in steps)

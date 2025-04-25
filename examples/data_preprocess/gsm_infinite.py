@@ -21,6 +21,8 @@ def make_map_fn(split):
     def process_fn(example, idx):
         solution = extract_solution(example['solution'])
         full_question = example['messages'][0]['content']
+        full_question = '\n Please output the answer in the format of "ANSWER:\n" + answer'
+        example['messages'][0]['content'] = full_question
         data = {
             "data_source": data_source,
             "prompt": example.pop('messages'),
@@ -74,7 +76,6 @@ if __name__ == '__main__':
         test_dataset = test_dataset.map(function=make_map_fn('test'), with_indices=True)
 
         test_dataset.to_parquet(os.path.join(args.local_dir, f'test_op_{n}.parquet'))
-        breakpoint()
 
         if args.hdfs_dir is not None:
             makedirs(args.hdfs_dir)

@@ -514,7 +514,7 @@ class FSDPSFTTrainer:
                 position_ids = position_ids.to(self.device_mesh.device_type)
             else:
                 position_ids = None
-            
+
             # FSDP summon_full_params context for generation
             with FSDP.summon_full_params(self.fsdp_model, writeback=False):
                 output_sequences = self.fsdp_model.generate(
@@ -530,7 +530,7 @@ class FSDPSFTTrainer:
         
         # Convert to text
         generated_texts = [self.tokenizer.decode(seq, skip_special_tokens=True) for seq in generated_sequences]
-        
+
         return generated_texts
 
     def run_validation(self):
@@ -554,6 +554,8 @@ class FSDPSFTTrainer:
             reward_fn_name = self.config.validation.reward_fn.name
             reward_fn = load_extern_type(reward_fn_path, reward_fn_name)
 
+        # Aggregate metrics
+        aggregated_metrics = {}
         for val_name, val_dataloader in self.val_dataloader_list.items():
             for batch in tqdm(val_dataloader, desc=f"Validation ({val_name})", disable=self.device_mesh.get_rank() != 0):
                 # Generate predictions for this batch
@@ -578,9 +580,6 @@ class FSDPSFTTrainer:
                             **self.config.validation.reward_fn.get("kwargs", {})
                         )
                         rewards.append(result)
-
-            # Aggregate metrics
-            aggregated_metrics = {}
             
             if reward_fn:
                 # Average reward
@@ -705,15 +704,16 @@ class FSDPSFTTrainer:
                 # For early exit validation
                 if is_last_step:
                     # Perform final validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {"val/loss": avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=self.global_steps)
+                    for val_name, val_dataloader in self.val_dataloader_list.items():
+                        val_losses = []
+                        for val_data in val_dataloader:
+                            val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+                            val_loss = self.validation_step(val_data)
+                            val_losses.append(val_loss)
+                        if rank == 0:
+                            avg_val_loss = torch.mean(torch.stack(val_losses))
+                            metric = {f"val/{val_name}/loss": avg_val_loss.detach().item()}
+                            tracking.log(data=metric, step=self.global_steps)
                     torch.distributed.barrier()
 
                     # Final generation-based validation if enabled
