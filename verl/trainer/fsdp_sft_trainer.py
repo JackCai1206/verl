@@ -154,12 +154,16 @@ class FSDPSFTTrainer:
         )
         
         # Validation dataset - validation mode enabled
-        self.val_dataset = dataset_cls(
-            parquet_files=config.data.val_files, 
-            tokenizer=self.tokenizer, 
-            config=config.data,
-            validation_mode=True
-        )
+        self.val_dataset_list = {}
+        for val_file in config.data.val_files:
+            # Extract the base file name without extension for dataset naming
+            val_name = os.path.basename(val_file).split('.')[0]
+            self.val_dataset_list[val_name] = dataset_cls(
+                parquet_files=val_file,
+                tokenizer=self.tokenizer,
+                config=config.data,
+                validation_mode=True
+            )
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
@@ -189,17 +193,23 @@ class FSDPSFTTrainer:
             drop_last=True,
         )
 
-        self.val_sampler = DistributedSampler(
-            self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
-        )
-        self.val_dataloader = DataLoader(
-            dataset=self.val_dataset,
-            batch_size=config.data.micro_batch_size_per_gpu,
-            sampler=self.val_sampler,
-            num_workers=8,
-            pin_memory=True,
-            drop_last=True,
-        )
+        self.val_dataloader_list = {}
+        for val_name, val_dataset in self.val_dataset_list.items():
+            self.val_sampler = DistributedSampler(
+                val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
+            )
+            self.val_dataloader_list[val_name] = DataLoader(
+                dataset=val_dataset,
+                batch_size=config.validation.batch_size,
+                sampler=self.val_sampler,
+                num_workers=8,
+                pin_memory=True,
+                drop_last=False,
+            )
+        if self.device_mesh.get_rank() == 0:
+            print(f"Train dataset size: {len(self.train_dataloader)}")
+            for val_name, val_dataloader in self.val_dataloader_list.items():
+                print(f"Validation dataset {val_name} size: {len(val_dataloader)}")
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -471,42 +481,6 @@ class FSDPSFTTrainer:
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
 
-    def generate_for_validation(self, batch, max_length=None):
-        """Generate text responses for validation"""
-        self.fsdp_model.eval()
-        
-        input_ids = batch["input_ids"].cuda()
-        attention_mask = batch["attention_mask"].cuda()
-        
-        if max_length is None:
-            max_length = self.config.validation.max_length
-            
-        # Set generation parameters
-        gen_kwargs = {
-            "max_length": max_length,
-            "num_beams": self.config.validation.get("num_beams", 1),
-            "do_sample": self.config.validation.get("do_sample", False),
-            "temperature": self.config.validation.get("temperature", 1.0),
-            "top_p": self.config.validation.get("top_p", 1.0),
-            "top_k": self.config.validation.get("top_k", 50),
-        }
-        
-        with torch.no_grad():
-            output_sequences = self.fsdp_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                **gen_kwargs
-            )
-            
-        # Get only the generated text portion (excluding input prompt)
-        generated_sequences = output_sequences[:, input_ids.shape[1]:]
-        
-        # Convert to text
-        generated_texts = [self.tokenizer.decode(seq, skip_special_tokens=True) for seq in generated_sequences]
-        input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-        
-        return input_texts, generated_texts
-
     def generate_text(self, input_ids, attention_mask, position_ids=None):
         """Generate text using the model for validation"""
         self.fsdp_model.eval()
@@ -529,7 +503,7 @@ class FSDPSFTTrainer:
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
-        
+
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             # Move inputs to the correct device
             input_ids = input_ids.to(self.device_mesh.device_type)
@@ -566,7 +540,7 @@ class FSDPSFTTrainer:
         
         self.fsdp_model.eval()
         
-        all_metrics = []
+        rewards = []
         all_inputs = []
         all_predictions = []
         all_ground_truths = []
@@ -579,52 +553,51 @@ class FSDPSFTTrainer:
             reward_fn_path = self.config.validation.reward_fn.path
             reward_fn_name = self.config.validation.reward_fn.name
             reward_fn = load_extern_type(reward_fn_path, reward_fn_name)
-        
-        for batch in self.val_dataloader:
-            # Generate predictions for this batch
-            input_ids = batch["input_ids"]
-            attention_mask = batch["attention_mask"]
-            position_ids = batch["position_ids"]
-            raw_prompts = batch["raw_prompt"]
-            raw_responses = batch["raw_response"]
+
+        for val_name, val_dataloader in self.val_dataloader_list.items():
+            for batch in tqdm(val_dataloader, desc=f"Validation ({val_name})", disable=self.device_mesh.get_rank() != 0):
+                # Generate predictions for this batch
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
+                position_ids = batch["position_ids"]
+                raw_prompts = batch["raw_prompt"]
+                raw_responses = batch["raw_response"]
+                
+                # Run generation
+                generated_texts = self.generate_text(input_ids, attention_mask, position_ids)
+                
+                # Collect results
+                all_inputs.extend(raw_prompts)
+                all_predictions.extend(generated_texts)
+                all_ground_truths.extend(raw_responses)
+                
+                # Compute metrics for each example
+                if reward_fn:
+                    for prompt, pred, truth in zip(raw_prompts, generated_texts, raw_responses):
+                        result = reward_fn(pred, truth, prompt,
+                            **self.config.validation.reward_fn.get("kwargs", {})
+                        )
+                        rewards.append(result)
+
+            # Aggregate metrics
+            aggregated_metrics = {}
             
-            
-            # Run generation
-            generated_texts = self.generate_text(input_ids, attention_mask, position_ids)
-            
-            # Collect results
-            all_inputs.extend(raw_prompts)
-            all_predictions.extend(generated_texts)
-            all_ground_truths.extend(raw_responses)
-            
-            # Compute metrics for each example
             if reward_fn:
-                for prompt, pred, truth in zip(raw_prompts, generated_texts, raw_responses):
-                    result = reward_fn(pred, truth, prompt,
-                        **self.config.validation.reward_fn.get("kwargs", {})
-                    )
-                    all_metrics.append(result)
-        
-        # Aggregate metrics
-        aggregated_metrics = {}
-        
-        if reward_fn:
-            # Average reward
-            rewards = [m["reward"] for m in all_metrics]
-            aggregated_metrics["val/reward_mean"] = sum(rewards) / len(rewards)
-            aggregated_metrics["val/reward_max"] = max(rewards)
-            aggregated_metrics["val/reward_min"] = min(rewards)
+                # Average reward
+                aggregated_metrics[f"val/{val_name}/reward_mean"] = sum(rewards) / len(rewards)
+                aggregated_metrics[f"val/{val_name}/reward_max"] = max(rewards)
+                aggregated_metrics[f"val/{val_name}/reward_min"] = min(rewards)
+                
+                # Aggregate other metrics if available
+                # if "extra_info" in all_metrics[0]:
+                #     for key in all_metrics[0]["extra_info"]:
+                #         values = [m["extra_info"][key] for m in all_metrics if key in m["extra_info"]]
+                #         if isinstance(values[0], (int, float)):
+                #             aggregated_metrics[f"val/{key}_mean"] = sum(values) / len(values)
             
-            # Aggregate other metrics if available
-            if "extra_info" in all_metrics[0]:
-                for key in all_metrics[0]["extra_info"]:
-                    values = [m["extra_info"][key] for m in all_metrics if key in m["extra_info"]]
-                    if isinstance(values[0], (int, float)):
-                        aggregated_metrics[f"val/{key}_mean"] = sum(values) / len(values)
-        
-        # Log example generations
-        self._log_validation_generations(all_inputs, all_predictions, all_ground_truths, 
-                                    [m["reward"] if reward_fn else 0.0 for m in all_metrics] if reward_fn else None)
+            # Log example generations
+            self._log_validation_generations(all_inputs, all_predictions, all_ground_truths, 
+                                        rewards if reward_fn else None)
         
         return aggregated_metrics
 
@@ -652,24 +625,24 @@ class FSDPSFTTrainer:
         # Log to configured loggers
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-        def save_checkpoint(self, step):
-            # save checkpoint
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+    def save_checkpoint(self, step):
+        # save checkpoint
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
-            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
-                state_dict = self.fsdp_model.state_dict()
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
+            state_dict = self.fsdp_model.state_dict()
 
-            path = os.path.join(self.config.trainer.default_local_dir, f"global_step_{step}")
-            # save huggingface model
-            if self.device_mesh.get_rank() == 0:
-                os.makedirs(path, exist_ok=True)
-                self.model.save_pretrained(path, state_dict=state_dict)
-                self.tokenizer.save_pretrained(path)
-                if self.config.trainer.default_hdfs_dir:
-                    hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
-                    hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
-            torch.distributed.barrier()
+        path = os.path.join(self.config.trainer.default_local_dir, f"global_step_{step}")
+        # save huggingface model
+        if self.device_mesh.get_rank() == 0:
+            os.makedirs(path, exist_ok=True)
+            self.model.save_pretrained(path, state_dict=state_dict)
+            self.tokenizer.save_pretrained(path)
+            if self.config.trainer.default_hdfs_dir:
+                hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
+                hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
+        torch.distributed.barrier()
 
     def fit(self):
         rank = self.device_mesh.get_rank()
@@ -754,15 +727,15 @@ class FSDPSFTTrainer:
                     return
 
             # validation
-            val_losses = []
-            for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
-            if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {"val/loss": val_loss.detach().item()}
-                tracking.log(data=metric, step=self.global_steps)
+            # val_losses = []
+            # for data in self.val_dataloader:
+            #     data = TensorDict(data, batch_size=self.config.validation.batch_size).cuda()
+            #     val_loss = self.validation_step(data)
+            #     val_losses.append(val_loss)
+            # if rank == 0:
+            #     val_loss = torch.mean(torch.stack(val_losses))
+            #     metric = {"val/loss": val_loss.detach().item()}
+            #     tracking.log(data=metric, step=self.global_steps)
             torch.distributed.barrier()
 
             # save checkpoint
