@@ -31,7 +31,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.prompt_key=extra_info \
     data.response_key=extra_info \
     data.train_batch_size=128 \
-    optim.lr=1e-5 \
+    optim.lr=5e-5 \
     data.prompt_dict_keys=['question'] \
     +data.response_dict_keys=['answer'] \
     model.partial_pretrain=$model\
