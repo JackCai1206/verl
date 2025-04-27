@@ -21,7 +21,7 @@ def make_map_fn(split):
     def process_fn(example, idx):
         solution = extract_solution(example['solution'])
         full_question = example['messages'][0]['content']
-        full_question = '\n Please output the answer in the format of "ANSWER:\n" + answer'
+        full_question += '\n Please output the answer in the format of "ANSWER:\n" + answer'
         example['messages'][0]['content'] = full_question
         data = {
             "data_source": data_source,

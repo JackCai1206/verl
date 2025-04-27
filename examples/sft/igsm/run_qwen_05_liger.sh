@@ -13,8 +13,10 @@ shift 2
 
 export WANDB_MODE="online"
 
-model=Qwen/Qwen2.5-0.5B-Instruct
+# model=Qwen/Qwen2.5-0.5B-Instruct
 # model=HuggingFaceTB/SmolLM2-135M-Instruct
+# model=Qwen/Qwen2.5-7B-Instruct
+model=Qwen/Qwen2.5-Math-1.5B-Instruct
 
 for round in {1..5}; do
     experiment_name=igsm-sft-$model-liger-round_$round
@@ -48,10 +50,10 @@ for round in {1..5}; do
         data.val_files=$test_files \
         data.prompt_key=extra_info \
         data.response_key=extra_info \
+        data.train_batch_size=128 \
         optim.lr=1e-4 \
         data.prompt_dict_keys=['full_question'] \
         +data.response_dict_keys=['full_solution'] \
-        data.micro_batch_size=4 \
         model.partial_pretrain=$last_round_name \
         model.use_liger=True \
         trainer.default_local_dir=$save_path/$experiment_name \
