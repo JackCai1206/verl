@@ -79,4 +79,4 @@ trainer:
   seed: 1
   # Added for the validation generations visualization
   log_val_generations: 10  # Number of validation examples to log (0 to disable)
-  save_freq: 100  # How often to save checkpoints (in steps)
+  save_freq: 0  # How often to save checkpoints (in steps)

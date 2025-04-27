@@ -54,8 +54,8 @@ for round in {1..5}; do
         optim.lr=1e-4 \
         data.prompt_dict_keys=['full_question'] \
         +data.response_dict_keys=['full_solution'] \
-        model.partial_pretrain=$last_round_name \
-        model.use_liger=True \
+        model.partial_pretrain=$save_path/$experiment_name/global_step_372 \
+        model.use_liger=true \
         trainer.default_local_dir=$save_path/$experiment_name \
         trainer.project_name=igsm-sft \
         trainer.experiment_name=$experiment_name \
@@ -63,6 +63,7 @@ for round in {1..5}; do
         trainer.default_hdfs_dir=null $@ \
         validation.reward_fn.path="/home/ubuntu/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
         validation.reward_fn.name="compute_score" \
-        use_remove_padding=false
+        validation.val_before_train=false \
+        use_remove_padding=false 
 done
         # trainer.resume_path=$save_path/$experiment_name \

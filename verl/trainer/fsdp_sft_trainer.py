@@ -517,11 +517,13 @@ class FSDPSFTTrainer:
 
             # FSDP summon_full_params context for generation
             with FSDP.summon_full_params(self.fsdp_model, writeback=False):
+                # output_sequences = self.fsdp_model.generate(input_ids=input_ids[0], attention_mask=attention_mask[0], position_ids=position_ids[0])
                 output_sequences = self.fsdp_model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    **gen_kwargs
+                    use_cache=True,
+                    # **gen_kwargs
                 )
 
         # Extract just the generated part (excluding prompt)
@@ -576,7 +578,7 @@ class FSDPSFTTrainer:
                 # Compute metrics for each example
                 if reward_fn:
                     for prompt, pred, truth in zip(raw_prompts, generated_texts, raw_responses):
-                        result = reward_fn(pred, truth, prompt,
+                        result = reward_fn(pred, truth,
                             **self.config.validation.reward_fn.get("kwargs", {})
                         )
                         rewards.append(result)
@@ -707,7 +709,7 @@ class FSDPSFTTrainer:
                     for val_name, val_dataloader in self.val_dataloader_list.items():
                         val_losses = []
                         for val_data in val_dataloader:
-                            val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+                            val_data = TensorDict(val_data, batch_size=self.config.validation.batch_size).cuda()
                             val_loss = self.validation_step(val_data)
                             val_losses.append(val_loss)
                         if rank == 0:
