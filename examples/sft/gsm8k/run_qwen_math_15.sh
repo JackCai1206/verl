@@ -35,7 +35,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     optim.lr=5e-5 \
     data.prompt_dict_keys=['question'] \
     +data.response_dict_keys=['answer'] \
-    model.partial_pretrain=/home/ubuntu/Jack/checkpoints/gsm8k-sft-meta-llama/Llama-3.2-1B-Instruct-liger/global_step_58\
+    model.partial_pretrain=$model \
     model.use_liger=true \
     trainer.default_local_dir=$save_path/$experiment_name \
     trainer.project_name=igsm-sft \

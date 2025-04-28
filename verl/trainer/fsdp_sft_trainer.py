@@ -704,16 +704,16 @@ class FSDPSFTTrainer:
                 # For early exit validation
                 if is_last_step:
                     # Perform final validation
-                    for val_name, val_dataloader in self.val_dataloader_list.items():
-                        val_losses = []
-                        for val_data in val_dataloader:
-                            val_data = TensorDict(val_data, batch_size=self.config.validation.batch_size).cuda()
-                            val_loss = self.validation_step(val_data)
-                            val_losses.append(val_loss)
-                        if rank == 0:
-                            avg_val_loss = torch.mean(torch.stack(val_losses))
-                            metric = {f"val/{val_name}/loss": avg_val_loss.detach().item()}
-                            tracking.log(data=metric, step=self.global_steps)
+                    # for val_name, val_dataloader in self.val_dataloader_list.items():
+                    #     val_losses = []
+                    #     for val_data in val_dataloader:
+                    #         val_data = TensorDict(val_data, batch_size=self.config.validation.batch_size).cuda()
+                    #         val_loss = self.validation_step(val_data)
+                    #         val_losses.append(val_loss)
+                    #     if rank == 0:
+                    #         avg_val_loss = torch.mean(torch.stack(val_losses))
+                    #         metric = {f"val/{val_name}/loss": avg_val_loss.detach().item()}
+                    #         tracking.log(data=metric, step=self.global_steps)
                     torch.distributed.barrier()
 
                     # Final generation-based validation if enabled
