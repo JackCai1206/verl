@@ -13,6 +13,8 @@ n_levels = 5
 data_source = "sbaumohl/gsm_infinite_symbolic_2.5k_10"
 
 pattern = r"ANSWER:\s*(V\d+(?:\s*,\s*V\d+)*)\.?\s*\Z"
+instr_replace = "Show your step-by-step reasoning and calculations, and then conclude your final answer in a sentence."
+instr = "Show your step-by-step reasoning, and then conclude with your final answer at the end of your message in a comma seperated list in the format: 'ANSWER: SYMBOL, SYMBOL, SYMBOL, ...'"
 
 # regex is expensive, let's cache this
 @lru_cache(maxsize=1024)
@@ -44,7 +46,7 @@ def process_fn(split, example, idx):
         "data_source": data_source,
         "prompt": [{
             "role": "user",
-            "content": example["messages"][0]["content"],
+            "content": example["messages"][0]["content"].replace(instr_replace, instr),
         }],
         "ability": "math",
         "reward_model": {
