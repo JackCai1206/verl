@@ -15,8 +15,8 @@ export WANDB_MODE="online"
 
 # model=Qwen/Qwen2.5-0.5B-Instruct
 # model=HuggingFaceTB/SmolLM2-135M-Instruct
-# model=Qwen/Qwen2.5-Math-1.5B-Instruct
-model=meta-llama/Llama-3.2-1B-Instruct
+model=Qwen/Qwen2.5-Math-1.5B-Instruct
+# model=meta-llama/Llama-3.2-1B-Instruct
 
 
 experiment_name=gsm8k-sft-$model-liger
