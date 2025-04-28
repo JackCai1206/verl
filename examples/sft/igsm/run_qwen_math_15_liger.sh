@@ -1,7 +1,7 @@
 set -e
 
 if [ "$#" -lt 2 ]; then
-    echo "Usage: run_qwen_05_sp2.sh <nproc_per_node> <save_path> [other_configs...]"
+    echo "Usage: run_qwen_math_15_liger.sh <nproc_per_node> <save_path> [other_configs...]"
     exit 1
 fi
 
@@ -51,19 +51,19 @@ for round in {1..5}; do
         data.prompt_key=extra_info \
         data.response_key=extra_info \
         data.train_batch_size=128 \
-        optim.lr=1e-4 \
+        optim.lr=5e-5 \
         data.prompt_dict_keys=['full_question'] \
         +data.response_dict_keys=['full_solution'] \
-        model.partial_pretrain=$save_path/$experiment_name/global_step_372 \
+        model.partial_pretrain=$last_round_name \
         model.use_liger=true \
+        trainer.resume_from_checkpoint=true \
         trainer.default_local_dir=$save_path/$experiment_name \
         trainer.project_name=igsm-sft \
         trainer.experiment_name=$experiment_name \
         trainer.logger=['console','wandb'] \
         trainer.default_hdfs_dir=null $@ \
         validation.reward_fn.path="/home/ubuntu/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
-        validation.reward_fn.name="compute_score" \
-        validation.val_before_train=false \
+        validation.val_before_train=true \
         use_remove_padding=false 
 done
         # trainer.resume_path=$save_path/$experiment_name \

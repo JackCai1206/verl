@@ -11,7 +11,7 @@ save_path=$2
 # Shift the arguments so $@ refers to the rest
 shift 2
 
-export WANDB_MODE="online"
+export WANDB_MODE="disabled"
 
 # model=Qwen/Qwen2.5-0.5B-Instruct
 # model=HuggingFaceTB/SmolLM2-135M-Instruct

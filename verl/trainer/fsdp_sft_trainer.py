@@ -108,13 +108,23 @@ class FSDPSFTTrainer:
         # Initialize the validation generations logger
         self.validation_generations_logger = ValidationGenerationsLogger()
         
+        # Check for resuming from checkpoint
+        self.global_steps = 0
+        self.resume_checkpoint = self._find_latest_checkpoint() if getattr(self.config.trainer, "resume_from_checkpoint", False) else None
+        
         self._build_dataloader()
-        # build model
+        # build model and optimizer (will load from checkpoint if available)
         self._build_model_optimizer()
+
+        # Load optimizer and scheduler state if resuming
+        if self.resume_checkpoint:
+            self._load_checkpoint_states(self.resume_checkpoint)
 
         # TODO: add checkpoint manager
         if self.device_mesh.get_rank() == 0:
             print(self.config)
+            if self.resume_checkpoint:
+                print(f"Resuming from checkpoint: {self.resume_checkpoint}")
 
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
@@ -215,7 +225,14 @@ class FSDPSFTTrainer:
         # TODO (zhangchi.usc1992):
         # 1. support pretrain from random weights
         # 2. support init directly from sharded weights
-        local_model_path = copy_to_local(src=self.config.model.partial_pretrain, verbose=True)
+
+        # Determine model load path - checkpoint if resuming or original model path
+        if self.resume_checkpoint and os.path.exists(self.resume_checkpoint):
+            model_load_path = self.resume_checkpoint
+            if self.device_mesh.get_rank() == 0:
+                print(f"Loading model weights from checkpoint: {model_load_path}")
+        else:
+            model_load_path = copy_to_local(src=self.config.model.partial_pretrain, verbose=True)
 
         if self.config.model.get("external_lib", None) is not None:
             # This is used to import external_lib into the huggingface systems
@@ -227,7 +244,7 @@ class FSDPSFTTrainer:
 
         trust_remote_code = self.config.model.trust_remote_code
         # load config first
-        config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=trust_remote_code)
+        config = AutoConfig.from_pretrained(model_load_path, trust_remote_code=trust_remote_code)
         if self.config.ulysses_sequence_parallel_size > 1:
             assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
 
@@ -238,7 +255,7 @@ class FSDPSFTTrainer:
 
         with init_context():
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-                local_model_path,
+                model_load_path,
                 config=config,
                 torch_dtype=torch.float32,
                 attn_implementation="flash_attention_2",
@@ -487,7 +504,7 @@ class FSDPSFTTrainer:
         self.fsdp_model.eval()
         
         # Set generation parameters from config
-        max_new_tokens = self.config.validation.get("max_new_tokens", response_length)
+        max_new_tokens = self.config.validation.get("max_new_tokens", response_length * 2)
         do_sample = self.config.validation.get("do_sample", False)
         num_beams = self.config.validation.get("num_beams", 1)
         temperature = self.config.validation.get("temperature", 1.0)
@@ -563,6 +580,7 @@ class FSDPSFTTrainer:
                 response_length = max(batch["response_length"])
                 raw_prompts = batch["raw_prompt"]
                 raw_responses = batch["raw_response"]
+                ground_truths = [extract_solution(r) for r in raw_responses]
                 
                 # Run generation
                 generated_texts = self.generate_text(input_ids, attention_mask, response_length)
@@ -570,11 +588,11 @@ class FSDPSFTTrainer:
                 # Collect results
                 all_inputs.extend(raw_prompts)
                 all_predictions.extend(generated_texts)
-                all_ground_truths.extend([extract_solution(r) for r in raw_responses])
+                all_ground_truths.extend(ground_truths)
 
                 # Compute metrics for each example
                 if reward_fn:
-                    for prompt, pred, truth in zip(raw_prompts, generated_texts, all_ground_truths):
+                    for prompt, pred, truth in zip(raw_prompts, generated_texts, ground_truths):
                         result = reward_fn(pred, truth,
                             **self.config.validation.reward_fn.get("kwargs", {})
                         )
@@ -638,6 +656,23 @@ class FSDPSFTTrainer:
             os.makedirs(path, exist_ok=True)
             self.model.save_pretrained(path, state_dict=state_dict)
             self.tokenizer.save_pretrained(path)
+            
+            # Save optimizer state
+            optimizer_state = self.optimizer.state_dict()
+            torch.save(optimizer_state, os.path.join(path, "optimizer.pt"))
+            
+            # Save scheduler state
+            scheduler_state = self.lr_scheduler.state_dict()
+            torch.save(scheduler_state, os.path.join(path, "scheduler.pt"))
+            
+            # Save additional training state
+            training_state = {
+                "step": step,
+                "epoch": getattr(self, "current_epoch", 0)
+            }
+            with open(os.path.join(path, "training_state.json"), 'w') as f:
+                json.dump(training_state, f)
+            
             if self.config.trainer.default_hdfs_dir:
                 hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
@@ -654,7 +689,13 @@ class FSDPSFTTrainer:
                 default_backend=self.config.trainer.logger,
             )
 
-        self.global_steps = 0
+        # Initialize or resume global steps
+        if not hasattr(self, "global_steps") or self.global_steps is None:
+            self.global_steps = 0
+        
+        # Initialize or resume current epoch
+        self.current_epoch = getattr(self, "current_epoch", 0)
+        
         # compute the total training steps.
         # the total training steps in SFT is mainly for early exit
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -664,9 +705,12 @@ class FSDPSFTTrainer:
 
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
+        if self.global_steps > 0:
+            print(f"Resuming from step {self.global_steps}/{self.total_training_steps}")
 
-        # Perform validation before training if configured
-        if hasattr(self.config, "validation") and self.config.validation.enable and self.config.validation.get("val_before_train", True):
+        # Perform validation before training if configured and not resuming
+        if (hasattr(self.config, "validation") and self.config.validation.enable and 
+            self.config.validation.get("val_before_train", True) and self.global_steps == 0):
             val_metrics = self.run_validation()
             if rank == 0:
                 print(f"Initial validation metrics: {val_metrics}")
@@ -674,72 +718,190 @@ class FSDPSFTTrainer:
 
         # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.
 
-        for epoch in range(self.config.trainer.total_epochs):
+        for epoch in range(self.current_epoch, self.config.trainer.total_epochs):
+            self.current_epoch = epoch
             self.train_sampler.set_epoch(epoch=epoch)
-            for data in tqdm(
-                self.train_dataloader,
-                total=self.steps_per_epoch,
+            
+            # Skip batches that have already been processed when resuming
+            if self.resume_checkpoint and epoch == self.current_epoch:
+                skip_batches = self.global_steps % len(self.train_dataloader)
+                iteration_start = skip_batches
+            else:
+                iteration_start = 0
+                
+            # Convert to iterator so we can skip batches
+            train_iter = iter(self.train_dataloader)
+            
+            # Skip batches if resuming
+            for _ in range(iteration_start):
+                next(train_iter)
+            
+            # Determine number of remaining batches in this epoch
+            remaining_batches = len(self.train_dataloader) - iteration_start
+            
+            for _ in tqdm(
+                range(remaining_batches),
+                initial=iteration_start,
+                total=len(self.train_dataloader),
                 desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
             ):
-                self.global_steps += 1
-                data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
-                metric = self.training_step(data)
-                if rank == 0:
-                    tracking.log(data=metric, step=self.global_steps)
-
-                # Run validation if configured
-                is_last_step = self.global_steps >= self.total_training_steps
-                if (hasattr(self.config, "validation") and 
-                    self.config.validation.enable and 
-                    self.config.validation.test_freq > 0 and 
-                    (is_last_step or self.global_steps % self.config.validation.test_freq == 0)):
-                    val_metrics = self.run_validation()
+                try:
+                    data = next(train_iter)
+                    self.global_steps += 1
+                    data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
+                    metric = self.training_step(data)
                     if rank == 0:
-                        tracking.log(data=val_metrics, step=self.global_steps)
+                        tracking.log(data=metric, step=self.global_steps)
 
-                # Save checkpoint if needed
-                if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                    self.save_checkpoint(step=self.global_steps)
-
-                # For early exit validation
-                if is_last_step:
-                    # Perform final validation
-                    # for val_name, val_dataloader in self.val_dataloader_list.items():
-                    #     val_losses = []
-                    #     for val_data in val_dataloader:
-                    #         val_data = TensorDict(val_data, batch_size=self.config.validation.batch_size).cuda()
-                    #         val_loss = self.validation_step(val_data)
-                    #         val_losses.append(val_loss)
-                    #     if rank == 0:
-                    #         avg_val_loss = torch.mean(torch.stack(val_losses))
-                    #         metric = {f"val/{val_name}/loss": avg_val_loss.detach().item()}
-                    #         tracking.log(data=metric, step=self.global_steps)
-                    torch.distributed.barrier()
-
-                    # Final generation-based validation if enabled
-                    if hasattr(self.config, "validation") and self.config.validation.enable:
-                        final_val_metrics = self.run_validation()
+                    # Run validation if configured
+                    is_last_step = self.global_steps >= self.total_training_steps
+                    if (hasattr(self.config, "validation") and 
+                        self.config.validation.enable and 
+                        self.config.validation.test_freq > 0 and 
+                        (is_last_step or self.global_steps % self.config.validation.test_freq == 0)):
+                        val_metrics = self.run_validation()
                         if rank == 0:
-                            tracking.log(data=final_val_metrics, step=self.global_steps)
+                            tracking.log(data=val_metrics, step=self.global_steps)
 
-                    # Save final checkpoint
-                    self.save_checkpoint(step=self.global_steps)
-                    return
+                    # Save checkpoint if needed
+                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                        self.save_checkpoint(step=self.global_steps)
 
-            # validation
+                    # For early exit validation
+                    if is_last_step:
+                        # # Perform final validation
+                        # for val_name, val_dataloader in self.val_dataloader_list.items():
+                        #     val_losses = []
+                        #     for val_data in val_dataloader:
+                        #         val_data = TensorDict(val_data, batch_size=self.config.validation.batch_size).cuda()
+                        #         val_loss = self.validation_step(val_data)
+                        #         val_losses.append(val_loss)
+                        #     if rank == 0:
+                        #         avg_val_loss = torch.mean(torch.stack(val_losses))
+                        #         metric = {f"val/{val_name}/loss": avg_val_loss.detach().item()}
+                        #         tracking.log(data=metric, step=self.global_steps)
+                        torch.distributed.barrier()
+
+                        # Final generation-based validation if enabled
+                        if hasattr(self.config, "validation") and self.config.validation.enable:
+                            final_val_metrics = self.run_validation()
+                            if rank == 0:
+                                tracking.log(data=final_val_metrics, step=self.global_steps)
+
+                        # Save final checkpoint
+                        self.save_checkpoint(step=self.global_steps)
+                        return
+                        
+                except StopIteration:
+                    break
+
+            # End of epoch validation   
+            # Perplexity-based validation
             # val_losses = []
-            # for data in self.val_dataloader:
-            #     data = TensorDict(data, batch_size=self.config.validation.batch_size).cuda()
-            #     val_loss = self.validation_step(data)
-            #     val_losses.append(val_loss)
+            # for val_name, val_dataloader in self.val_dataloader_list.items():
+            #     val_losses_per_dataset = []
+            #     for data in val_dataloader:
+            #         data = TensorDict(data, batch_size=self.config.validation.batch_size).cuda()
+            #         val_loss = self.validation_step(data)
+            #         val_losses_per_dataset.append(val_loss)
+            #     val_losses.append((val_name, val_losses_per_dataset))
+            
             # if rank == 0:
-            #     val_loss = torch.mean(torch.stack(val_losses))
-            #     metric = {"val/loss": val_loss.detach().item()}
-            #     tracking.log(data=metric, step=self.global_steps)
+            #     for val_name, val_losses_per_dataset in val_losses:
+            #         val_loss = torch.mean(torch.stack(val_losses_per_dataset))
+            #         metric = {f"val/{val_name}/loss": val_loss.detach().item()}
+            #         tracking.log(data=metric, step=self.global_steps)
+            
+            # Generation-based validation at the end of each epoch
+            if hasattr(self.config, "validation") and self.config.validation.enable:
+                if rank == 0:
+                    print(f"Running generation-based validation at the end of epoch {epoch + 1}")
+                epoch_val_metrics = self.run_validation()
+                if rank == 0:
+                    print(f"Epoch {epoch + 1} validation metrics: {epoch_val_metrics}")
+                    tracking.log(data=epoch_val_metrics, step=self.global_steps)
+            
             torch.distributed.barrier()
 
-            # save checkpoint
+            # save checkpoint at the end of each epoch
             self.save_checkpoint(step=self.global_steps)
+            
+            # Clear resume checkpoint after successful epoch completion
+            self.resume_checkpoint = None
+
+    def _find_latest_checkpoint(self):
+        """Find the latest checkpoint based on step number"""
+        checkpoint_dir = self.config.trainer.default_local_dir
+        hdfs_dir = getattr(self.config.trainer, "default_hdfs_dir", None)
+        
+        # Function to find latest checkpoint in a directory
+        def find_latest_in_dir(directory, use_hdfs=False):
+            if use_hdfs:
+                if not hdfs_io.exists(directory):
+                    return None
+                checkpoints = hdfs_io.listdir(directory)
+            else:
+                if not os.path.exists(directory):
+                    return None
+                checkpoints = os.listdir(directory)
+                
+            steps = []
+            for checkpoint in checkpoints:
+                if checkpoint.startswith("global_step_"):
+                    step = extract_step(checkpoint)
+                    if step is not None:
+                        steps.append((step, os.path.join(directory, checkpoint)))
+            
+            if not steps:
+                return None
+            
+            # Return the path with the highest step
+            return sorted(steps, key=lambda x: x[0], reverse=True)[0][1]
+        
+        # First check local directory
+        latest_local = find_latest_in_dir(checkpoint_dir)
+        
+        # Then check HDFS if configured
+        latest_hdfs = None
+        if hdfs_dir:
+            latest_hdfs = find_latest_in_dir(hdfs_dir, use_hdfs=True)
+            if latest_hdfs and (latest_local is None or extract_step(latest_hdfs) > extract_step(latest_local)):
+                # Copy from HDFS to local
+                local_path = os.path.join(checkpoint_dir, os.path.basename(latest_hdfs))
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                hdfs_io.copy(latest_hdfs, local_path)
+                return local_path
+        
+        return latest_local
+
+    def _load_checkpoint_states(self, checkpoint_path):
+        """Load optimizer and scheduler states from checkpoint"""
+        if self.device_mesh.get_rank() == 0:
+            print(f"Loading optimizer and scheduler states from {checkpoint_path}")
+        
+        # Load optimizer and scheduler states if they exist
+        optimizer_path = os.path.join(checkpoint_path, "optimizer.pt")
+        scheduler_path = os.path.join(checkpoint_path, "scheduler.pt")
+        training_state_path = os.path.join(checkpoint_path, "training_state.json")
+        
+        # Load optimizer state if it exists
+        if os.path.exists(optimizer_path):
+            optimizer_state = torch.load(optimizer_path, map_location="cpu", weights_only=False)
+            self.optimizer.load_state_dict(optimizer_state)
+        
+        # Load scheduler state if it exists
+        if os.path.exists(scheduler_path):
+            scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
+            self.lr_scheduler.load_state_dict(scheduler_state)
+        
+        # Load additional training state if it exists
+        if os.path.exists(training_state_path):
+            with open(training_state_path, 'r') as f:
+                training_state = json.load(f)
+                if "step" in training_state:
+                    self.global_steps = training_state["step"]
+                if "epoch" in training_state:
+                    self.current_epoch = training_state["epoch"]
 
 
 import hydra

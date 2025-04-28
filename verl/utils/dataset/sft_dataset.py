@@ -50,7 +50,7 @@ class SFTDataset(Dataset):
         prompt_dict_keys = config.get("prompt_dict_keys", None)
         response_key = config.get("response_key", "response")
         response_dict_keys = config.get("response_dict_keys", None)
-        max_length = config.get("max_length", 1024)
+        max_length = config.get("max_length", 0)  # Default to 0 to enable dynamic padding
         truncation = config.get("truncation", "error")
 
         assert truncation in ["error", "left", "right"]
@@ -70,6 +70,7 @@ class SFTDataset(Dataset):
         self.response_dict_keys = response_dict_keys if response_dict_keys else []
 
         self.max_length = max_length
+        self.use_dynamic_padding = max_length <= 0  # Use dynamic padding if max_length is 0 or negative
 
         self._download()
         self._read_files_and_tokenize()
@@ -112,6 +113,34 @@ class SFTDataset(Dataset):
                 print(f"self.responses={self.responses}")
                 raise
         self.responses = self.responses.tolist()
+        
+        # Calculate optimal padding length if using dynamic padding
+        if self.use_dynamic_padding:
+            max_actual_length = 0
+            
+            # Sample up to 1000 examples for efficiency
+            sample_size = min(1000, len(self.prompts))
+            sample_indices = torch.randperm(len(self.prompts))[:sample_size].tolist()
+            
+            for idx in sample_indices:
+                prompt = self.prompts[idx]
+                response = self.responses[idx]
+                
+                # Apply chat template
+                prompt_chat = [{"role": "user", "content": prompt}]
+                prompt_chat_str = self.tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
+                response_chat_str = response + self.tokenizer.eos_token
+                
+                # Tokenize without padding to get actual length
+                prompt_ids = self.tokenizer(prompt_chat_str, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
+                response_ids = self.tokenizer(response_chat_str, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
+                
+                total_length = prompt_ids + response_ids
+                max_actual_length = max(max_actual_length, total_length)
+            
+            # Use the calculated max_length
+            print(f"Using dynamic padding with length: {max_actual_length}")
+            self.max_length = int(max_actual_length * 1.1) # Add 10% buffer
 
     def __len__(self):
         return len(self.prompts)

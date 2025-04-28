@@ -18,22 +18,20 @@ import re
 def extract_solution(solution_str):
     solution = re.search(r"ANSWER:\s*\n(.*?)(?:\n|$)", solution_str, re.IGNORECASE)
     if solution is None:
-        return ''
+        return None
     final_solution = solution.group(0)
     final_solution = final_solution.split('ANSWER:\n')
     if len(final_solution) < 2:
-        return ''
+        return None
     final_solution = final_solution[1].strip()
-    return final_solution
+    ans_set = set(map(lambda x: x.strip(), final_solution.split(',')))
+    return ans_set
 
 
-def compute_score(solution_str, ground_truth_str, prompt, method='strict', format_score=0., score=1.):
-    solution = extract_solution(solution_str=solution_str)
-    ground_truth = extract_solution(solution_str=ground_truth_str)
-    if solution is None:
+def compute_score(solution_str, ground_truth, method='strict', format_score=0., score=1.):
+    ans_set = extract_solution(solution_str=solution_str)
+    if ans_set is None:
         return 0
     else:
-        ans_set = set(map(lambda x: x.strip(), solution.split(',')))
-        gt_set = set(map(lambda x: x.strip(), ground_truth.split(',')))
-        score = len(ans_set.intersection(gt_set)) / len(gt_set) * score + format_score
+        score = len(ans_set.intersection(ground_truth)) / len(ground_truth) * score + format_score
         return score
