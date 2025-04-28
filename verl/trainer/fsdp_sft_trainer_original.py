@@ -15,6 +15,7 @@
 A lightweight one-file FSDP SFT Trainer
 TODO(zhangchi.usc1992)
 - Add calculation of mfu
+- Add validation
 """
 
 import os
@@ -24,18 +25,16 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import logging
 import re
-import json
-import numpy as np
-from collections import defaultdict
 from contextlib import nullcontext
 
+import hydra
 import torch
 import torch.distributed
 from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch import nn, optim
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -46,16 +45,17 @@ import verl.utils.hdfs_io as hdfs_io
 from verl.utils.dataset import SFTDataset
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.debug import log_gpu_memory_usage
+from verl.utils.distributed import initialize_global_process_group
 from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy, get_init_weight_context_manager, init_fn
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
-from verl.utils.tracking import Tracking, ValidationGenerationsLogger
+from verl.utils.tracking import Tracking
 from verl.utils.ulysses import (
     gather_outpus_and_unpad,
     get_ulysses_sequence_parallel_world_size,
     ulysses_pad_and_slice_inputs,
 )
-from verl.workers.sharding_manager import FSDPUlyssesShardingManager
+from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
@@ -105,9 +105,6 @@ class FSDPSFTTrainer:
             print(f"Using sequence parallel size: {self.config.ulysses_sequence_parallel_size}")
             print(f"Using remove padding: {self.use_remove_padding}")
 
-        # Initialize the validation generations logger
-        self.validation_generations_logger = ValidationGenerationsLogger()
-        
         self._build_dataloader()
         # build model
         self._build_model_optimizer()
@@ -121,9 +118,7 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(f"Normalize batch size by dp {dp_size}")
 
-        assert self.config.data.train_batch_size % dp_size == 0, (
-            f"Global batch size {self.config.data.train_batch_size} is not divisible by dp size {dp_size}"
-        )
+        assert self.config.data.train_batch_size % dp_size == 0, f"Global batch size {self.config.data.train_batch_size} is not divisible by dp size {dp_size}"
 
         self.config.data.train_batch_size //= dp_size
 
@@ -145,25 +140,8 @@ class FSDPSFTTrainer:
             dataset_cls = SFTDataset
 
         # Create datasets based on the selected class
-        # Training dataset - normal mode
-        self.train_dataset = dataset_cls(
-            parquet_files=config.data.train_files, 
-            tokenizer=self.tokenizer, 
-            config=config.data,
-            validation_mode=False
-        )
-        
-        # Validation dataset - validation mode enabled
-        self.val_dataset_list = {}
-        for val_file in config.data.val_files:
-            # Extract the base file name without extension for dataset naming
-            val_name = os.path.basename(val_file).split('.')[0]
-            self.val_dataset_list[val_name] = dataset_cls(
-                parquet_files=val_file,
-                tokenizer=self.tokenizer,
-                config=config.data,
-                validation_mode=True
-            )
+        self.train_dataset = dataset_cls(parquet_files=config.data.train_files, tokenizer=self.tokenizer, config=config.data)
+        self.val_dataset = dataset_cls(parquet_files=config.data.val_files, tokenizer=self.tokenizer, config=config.data)
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
@@ -181,9 +159,7 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(f"Using FSDP rank {rank} and size {world_size} for data distribution")
 
-        self.train_sampler = DistributedSampler(
-            self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True
-        )
+        self.train_sampler = DistributedSampler(self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True)
         self.train_dataloader = DataLoader(
             dataset=self.train_dataset,
             batch_size=config.data.train_batch_size,
@@ -193,23 +169,15 @@ class FSDPSFTTrainer:
             drop_last=True,
         )
 
-        self.val_dataloader_list = {}
-        for val_name, val_dataset in self.val_dataset_list.items():
-            self.val_sampler = DistributedSampler(
-                val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
-            )
-            self.val_dataloader_list[val_name] = DataLoader(
-                dataset=val_dataset,
-                batch_size=config.validation.batch_size,
-                sampler=self.val_sampler,
-                num_workers=8,
-                pin_memory=True,
-                drop_last=False,
-            )
-        if self.device_mesh.get_rank() == 0:
-            print(f"Train dataset size: {len(self.train_dataloader)}")
-            for val_name, val_dataloader in self.val_dataloader_list.items():
-                print(f"Validation dataset {val_name} size: {len(val_dataloader)}")
+        self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True)
+        self.val_dataloader = DataLoader(
+            dataset=self.val_dataset,
+            batch_size=config.data.micro_batch_size_per_gpu,
+            sampler=self.val_sampler,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=True,
+        )
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -232,9 +200,7 @@ class FSDPSFTTrainer:
             assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
 
         # This may be very large
-        init_context = get_init_weight_context_manager(
-            use_meta_tensor=not config.tie_word_embeddings, mesh=self.device_mesh
-        )
+        init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings, mesh=self.device_mesh)
 
         with init_context():
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
@@ -273,9 +239,7 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After model allocation", logger=logger)
 
-        mixed_precision = MixedPrecision(
-            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32
-        )
+        mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
 
         auto_wrap_policy = get_fsdp_wrap_policy(
             self.model,
@@ -318,20 +282,14 @@ class FSDPSFTTrainer:
         self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
 
         if self.device_mesh.get_rank() == 0:
-            print(
-                f"Number of steps/epoch {self.steps_per_epoch}, number of epochs {self.config.trainer.total_epochs}, total number of steps {self.total_steps}"
-            )
+            print(f"Number of steps/epoch {self.steps_per_epoch}, number of epochs {self.config.trainer.total_epochs}, total number of steps {self.total_steps}")
 
         num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)
 
         if not hasattr(self.config.optim, "lr_scheduler") or self.config.optim.lr_scheduler == "cosine":
-            self.lr_scheduler = get_cosine_schedule_with_warmup(
-                optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
-            )
+            self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps)
         elif self.config.optim.lr_scheduler == "wsd":
-            self.lr_scheduler = get_wsd_schedule_with_warmup(
-                optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
-            )
+            self.lr_scheduler = get_wsd_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps)
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 
@@ -352,9 +310,7 @@ class FSDPSFTTrainer:
             if not use_sp:
                 # Standard forward pass without sequence parallel
                 labels = input_ids[:, 1:].contiguous()
-                output = self.fsdp_model(
-                    input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
-                )
+                output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
                 logits = output.logits
 
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -375,25 +331,17 @@ class FSDPSFTTrainer:
 
                 batch_size, seqlen = input_ids.shape
                 # Remove padding
-                input_ids_rmpad, indices, *_ = unpad_input(
-                    input_ids.unsqueeze(-1), attention_mask
-                )  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
                 # Unpad position_ids to align rotary
-                position_ids_rmpad = index_first_axis(
-                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
-                ).transpose(0, 1)
+                position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
 
                 # Pad and slice inputs for sequence parallelism
-                input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
-                )
+                input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size())
                 # For computing loss
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
-                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad_rolled, None, get_ulysses_sequence_parallel_world_size()
-                )
+                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(input_ids_rmpad_rolled, None, get_ulysses_sequence_parallel_world_size())
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                 # Forward pass
@@ -412,9 +360,7 @@ class FSDPSFTTrainer:
                 loss = gather_outpus_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
 
                 # This is the loss collected from all ulysses ranks
-                full_loss = pad_input(
-                    hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
-                )
+                full_loss = pad_input(hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
                 full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
                 full_loss = full_loss.reshape(-1)
                 loss_mask = loss_mask.to(full_loss.device)
@@ -481,149 +427,6 @@ class FSDPSFTTrainer:
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
 
-    @torch.no_grad()
-    def generate_text(self, input_ids, attention_mask, response_length=128):
-        """Generate text using the model for validation"""
-        self.fsdp_model.eval()
-        
-        # Set generation parameters from config
-        max_new_tokens = self.config.validation.get("max_new_tokens", response_length)
-        do_sample = self.config.validation.get("do_sample", False)
-        num_beams = self.config.validation.get("num_beams", 1)
-        temperature = self.config.validation.get("temperature", 1.0)
-        top_k = self.config.validation.get("top_k", 50)
-        top_p = self.config.validation.get("top_p", 1.0)
-        
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "num_beams": num_beams,
-            "do_sample": do_sample,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-        }
-
-        # Move inputs to the correct device
-        input_ids = input_ids.to(self.device_mesh.device_type)
-        attention_mask = attention_mask.to(self.device_mesh.device_type)
-
-        # FSDP summon_full_params context for generation
-        with FSDP.summon_full_params(self.fsdp_model, writeback=False, recurse=False), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            output_sequences = self.fsdp_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=True,
-                **gen_kwargs
-            )
-
-        # Extract just the generated part (excluding prompt)
-        input_length = input_ids.shape[1]
-        generated_sequences = output_sequences[:, input_length:]
-        
-        # Convert to text
-        generated_texts = [self.tokenizer.decode(seq, skip_special_tokens=True) for seq in generated_sequences]
-
-        return generated_texts
-
-    @torch.no_grad()
-    def run_validation(self):
-        """Run generation-based validation and compute metrics"""
-        if not hasattr(self.config, "validation") or not self.config.validation.enable:
-            return {}
-        
-        self.fsdp_model.eval()
-        
-        rewards = []
-        all_inputs = []
-        all_predictions = []
-        all_ground_truths = []
-        
-        # Load reward function if configured
-        reward_fn = None
-        if hasattr(self.config.validation, "reward_fn") and self.config.validation.reward_fn.path:
-            from verl.utils.import_utils import load_extern_type
-            
-            reward_fn_path = self.config.validation.reward_fn.path
-            reward_fn_name = 'compute_score'
-            extract_fn_name = 'extract_solution'
-            reward_fn = load_extern_type(reward_fn_path, reward_fn_name)
-            extract_solution = load_extern_type(reward_fn_path, extract_fn_name)
-
-        # Aggregate metrics
-        aggregated_metrics = {}
-        for val_name, val_dataloader in self.val_dataloader_list.items():
-            for batch in tqdm(val_dataloader, desc=f"Validation ({val_name})", disable=self.device_mesh.get_rank() != 0):
-                # Generate predictions for this batch
-                input_ids = batch["input_ids"]
-                attention_mask = batch["attention_mask"]
-                # position_ids = batch["position_ids"]
-                # response_ids = batch["response_ids"]
-                response_length = max(batch["response_length"])
-                raw_prompts = batch["raw_prompt"]
-                raw_responses = batch["raw_response"]
-                
-                # Run generation
-                generated_texts = self.generate_text(input_ids, attention_mask, response_length)
-                
-                # Collect results
-                all_inputs.extend(raw_prompts)
-                all_predictions.extend(generated_texts)
-                all_ground_truths.extend([extract_solution(r) for r in raw_responses])
-
-                # Compute metrics for each example
-                if reward_fn:
-                    for prompt, pred, truth in zip(raw_prompts, generated_texts, all_ground_truths):
-                        result = reward_fn(pred, truth,
-                            **self.config.validation.reward_fn.get("kwargs", {})
-                        )
-                        rewards.append(result)
-            
-            if reward_fn:
-                # Average reward
-                aggregated_metrics[f"val/{val_name}/reward_mean"] = sum(rewards) / len(rewards)
-                aggregated_metrics[f"val/{val_name}/reward_max"] = max(rewards)
-                aggregated_metrics[f"val/{val_name}/reward_min"] = min(rewards)
-                
-                # Aggregate other metrics if available
-                # if "extra_info" in all_metrics[0]:
-                #     for key in all_metrics[0]["extra_info"]:
-                #         values = [m["extra_info"][key] for m in all_metrics if key in m["extra_info"]]
-                #         if isinstance(values[0], (int, float)):
-                #             aggregated_metrics[f"val/{key}_mean"] = sum(values) / len(values)
-            
-            # Log example generations
-            self._log_validation_generations(all_inputs, all_predictions, all_ground_truths, 
-                                        rewards if reward_fn else None)
-        
-        return aggregated_metrics
-
-    def _log_validation_generations(self, inputs, predictions, ground_truths, rewards=None):
-        """Log validation examples to visualization backend"""
-        if not hasattr(self.config.trainer, "log_val_generations") or self.config.trainer.log_val_generations <= 0:
-            return
-        
-        num_to_log = min(len(inputs), self.config.trainer.log_val_generations)
-        
-        # Create samples with format expected by ValidationGenerationsLogger
-        samples = []
-        for i in range(len(inputs)):
-            input_text = inputs[i]
-            output_text = f"Prediction:\n{predictions[i]}\n\nGround Truth:\n{ground_truths[i]}"
-            score = rewards[i] if rewards and i < len(rewards) else 0.0
-            samples.append((input_text, output_text, score))
-            # logger.info(f"Input: {input_text}\nOutput: {output_text}\nScore: {score}")
-        
-        # Randomly select examples if we have more than we need
-        if len(samples) > num_to_log:
-            import random
-            random.seed(42)  # Fixed seed for deterministic selections
-            samples = random.sample(samples, num_to_log)
-        
-        # Log to configured loggers
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
-
     def save_checkpoint(self, step):
         # save checkpoint
         from torch.distributed.fsdp import FullStateDictConfig, StateDictType
@@ -654,7 +457,7 @@ class FSDPSFTTrainer:
                 default_backend=self.config.trainer.logger,
             )
 
-        self.global_steps = 0
+        global_step = 0
         # compute the total training steps.
         # the total training steps in SFT is mainly for early exit
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -665,14 +468,8 @@ class FSDPSFTTrainer:
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
 
-        # Perform validation before training if configured
-        if hasattr(self.config, "validation") and self.config.validation.enable and self.config.validation.get("val_before_train", True):
-            val_metrics = self.run_validation()
-            if rank == 0:
-                print(f"Initial validation metrics: {val_metrics}")
-                tracking.log(data=val_metrics, step=self.global_steps)
-
-        # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.
+        # TODO (zhangchi.usc1992) add back checkpoint manager.
+        # Currently, it blocks when uploading to hdfs. So very slow.
 
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
@@ -681,74 +478,44 @@ class FSDPSFTTrainer:
                 total=self.steps_per_epoch,
                 desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
             ):
-                self.global_steps += 1
+                global_step += 1
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 metric = self.training_step(data)
                 if rank == 0:
-                    tracking.log(data=metric, step=self.global_steps)
+                    tracking.log(data=metric, step=global_step)
 
-                # Run validation if configured
-                is_last_step = self.global_steps >= self.total_training_steps
-                if (hasattr(self.config, "validation") and 
-                    self.config.validation.enable and 
-                    self.config.validation.test_freq > 0 and 
-                    (is_last_step or self.global_steps % self.config.validation.test_freq == 0)):
-                    val_metrics = self.run_validation()
-                    if rank == 0:
-                        tracking.log(data=val_metrics, step=self.global_steps)
-
-                # Save checkpoint if needed
-                if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                    self.save_checkpoint(step=self.global_steps)
-
-                # For early exit validation
-                if is_last_step:
+                # for early exit validation
+                if global_step >= self.total_training_steps:
                     # Perform final validation
-                    for val_name, val_dataloader in self.val_dataloader_list.items():
-                        val_losses = []
-                        for val_data in val_dataloader:
-                            val_data = TensorDict(val_data, batch_size=self.config.validation.batch_size).cuda()
-                            val_loss = self.validation_step(val_data)
-                            val_losses.append(val_loss)
-                        if rank == 0:
-                            avg_val_loss = torch.mean(torch.stack(val_losses))
-                            metric = {f"val/{val_name}/loss": avg_val_loss.detach().item()}
-                            tracking.log(data=metric, step=self.global_steps)
+                    val_losses = []
+                    for val_data in self.val_dataloader:
+                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+                        val_loss = self.validation_step(val_data)
+                        val_losses.append(val_loss)
+                    if rank == 0:
+                        avg_val_loss = torch.mean(torch.stack(val_losses))
+                        metric = {"val/loss": avg_val_loss.detach().item()}
+                        tracking.log(data=metric, step=global_step)
                     torch.distributed.barrier()
 
-                    # Final generation-based validation if enabled
-                    if hasattr(self.config, "validation") and self.config.validation.enable:
-                        final_val_metrics = self.run_validation()
-                        if rank == 0:
-                            tracking.log(data=final_val_metrics, step=self.global_steps)
-
                     # Save final checkpoint
-                    self.save_checkpoint(step=self.global_steps)
+                    self.save_checkpoint(step=global_step)
                     return
 
             # validation
-            # val_losses = []
-            # for data in self.val_dataloader:
-            #     data = TensorDict(data, batch_size=self.config.validation.batch_size).cuda()
-            #     val_loss = self.validation_step(data)
-            #     val_losses.append(val_loss)
-            # if rank == 0:
-            #     val_loss = torch.mean(torch.stack(val_losses))
-            #     metric = {"val/loss": val_loss.detach().item()}
-            #     tracking.log(data=metric, step=self.global_steps)
+            val_losses = []
+            for data in self.val_dataloader:
+                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+                val_loss = self.validation_step(data)
+                val_losses.append(val_loss)
+            if rank == 0:
+                val_loss = torch.mean(torch.stack(val_losses))
+                metric = {"val/loss": val_loss.detach().item()}
+                tracking.log(data=metric, step=global_step)
             torch.distributed.barrier()
 
             # save checkpoint
-            self.save_checkpoint(step=self.global_steps)
-
-
-import hydra
-from torch.distributed.device_mesh import init_device_mesh
-
-from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
-from verl.utils.distributed import initialize_global_process_group
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+            self.save_checkpoint(step=global_step)
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
@@ -757,9 +524,7 @@ def main(config):
 
     device_mesh = init_device_mesh(device_type="cuda", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     dp_size = world_size // config.ulysses_sequence_parallel_size
-    ulysses_device_mesh = init_device_mesh(
-        device_type="cuda", mesh_shape=(dp_size, config.ulysses_sequence_parallel_size), mesh_dim_names=("dp", "sp")
-    )
+    ulysses_device_mesh = init_device_mesh(device_type="cuda", mesh_shape=(dp_size, config.ulysses_sequence_parallel_size), mesh_dim_names=("dp", "sp"))
     trainer = FSDPSFTTrainer(config=config, device_mesh=device_mesh, ulysses_device_mesh=ulysses_device_mesh)
     trainer.fit()
 

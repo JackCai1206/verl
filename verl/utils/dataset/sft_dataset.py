@@ -145,9 +145,10 @@ class SFTDataset(Dataset):
             prompt_attention_mask = prompt_ids_output["attention_mask"][0]
             
             # Tokenize response
-            # response_chat_str = response + tokenizer.eos_token
-            # response_ids_output = tokenizer(response_chat_str, return_tensors="pt", add_special_tokens=False)
-            # response_ids = response_ids_output["input_ids"][0]
+            response_chat_str = response + tokenizer.eos_token
+            response_ids_output = tokenizer(response_chat_str, return_tensors="pt", add_special_tokens=False)
+            response_ids = response_ids_output["input_ids"][0]
+            response_length = response_ids.shape[0]
             
             # Left padding for inference
             prompt_length = prompt_ids.shape[0]
@@ -185,6 +186,7 @@ class SFTDataset(Dataset):
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
                 # "response_ids": response_ids,
+                "response_length": response_length,
                 "raw_prompt": prompt,
                 "raw_response": response,  # Pass the ground truth response for evaluation
             }
