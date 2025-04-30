@@ -66,23 +66,22 @@ if __name__ == '__main__':
         train_datasets.append(train_dataset)
         test_datasets.append(test_dataset)
 
-    for round in range(1, len(ds) - 4):
-        train_dataset = datasets.interleave_datasets(train_datasets[round-1:round + 4], seed=42)
-        train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
-        print(train_dataset[0])
+    # for round in range(1, len(ds) - 4):
+    #     train_dataset = datasets.interleave_datasets(train_datasets[round-1:round + 4], seed=42)
+    #     train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
+    #     print(train_dataset[0])
 
-        train_dataset.to_parquet(os.path.join(args.local_dir, f'train_{round}.parquet'))
-
-        if args.hdfs_dir is not None:    
-            makedirs(args.hdfs_dir)
-            copy(src=args.local_dir, dst=args.hdfs_dir)
+    #     train_dataset.to_parquet(os.path.join(args.local_dir, f'train_{round}.parquet'))
 
     for n in range(1, len(ds) + 1):
+        train_dataset = train_datasets[n - 1]
+        train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
+        train_dataset.to_parquet(os.path.join(args.local_dir, f'train_op_{n}.parquet'))
+        
         test_dataset = test_datasets[n - 1]
         test_dataset = test_dataset.map(function=make_map_fn('test'), with_indices=True)
-
         test_dataset.to_parquet(os.path.join(args.local_dir, f'test_op_{n}.parquet'))
 
-        if args.hdfs_dir is not None:
-            makedirs(args.hdfs_dir)
-            copy(src=args.local_dir, dst=args.hdfs_dir)
+    if args.hdfs_dir is not None:
+        makedirs(args.hdfs_dir)
+        copy(src=args.local_dir, dst=args.hdfs_dir)
