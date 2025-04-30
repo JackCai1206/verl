@@ -114,6 +114,8 @@ class SFTDataset(Dataset):
                 raise
         self.responses = self.responses.tolist()
         
+        self.extra_info = self.dataframe.get("extra_info", None)
+        
         # Calculate optimal padding length if using dynamic padding
         if self.use_dynamic_padding:
             max_actual_length = 0
@@ -130,12 +132,14 @@ class SFTDataset(Dataset):
                 prompt_chat = [{"role": "user", "content": prompt}]
                 prompt_chat_str = self.tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
                 response_chat_str = response + self.tokenizer.eos_token
-                
+
                 # Tokenize without padding to get actual length
                 prompt_ids = self.tokenizer(prompt_chat_str, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
-                response_ids = self.tokenizer(response_chat_str, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
-                
-                total_length = prompt_ids + response_ids
+                if self.validation_mode:
+                    total_length = prompt_ids
+                else:
+                    response_ids = self.tokenizer(response_chat_str, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
+                    total_length = prompt_ids + response_ids
                 max_actual_length = max(max_actual_length, total_length)
             
             # Use the calculated max_length

@@ -13,13 +13,13 @@ shift 2
 
 export WANDB_MODE="online"
 
-# model=Qwen/Qwen2.5-0.5B-Instruct
+model=Qwen/Qwen2.5-0.5B-Instruct
 # model=HuggingFaceTB/SmolLM2-135M-Instruct
 # model=Qwen/Qwen2.5-7B-Instruct
-model=Qwen/Qwen2.5-Math-1.5B-Instruct
+# model=Qwen/Qwen2.5-Math-1.5B-Instruct
 
-for round in {1..5}; do
-    experiment_name=igsm-sft-$model-liger-round_$round
+for round in {2..40}; do
+    experiment_name=igsm-sft-$model-liger-round_$round-no_label
     if [ "$round" -eq 1 ]; then
         last_round_name=$model
     else
@@ -35,7 +35,7 @@ for round in {1..5}; do
 
     # Create the list of test parquet files
     test_files=""
-    for ((n=round; n<=round+4; n++)); do
+    for ((n=round; n<=round+24; n+=3)); do
         # Add comma separator for multiple files
         if [ -n "$test_files" ]; then
             test_files="$test_files,"
@@ -44,26 +44,47 @@ for round in {1..5}; do
     done
     test_files="[$test_files]"
 
+    export WANDB_RUN_GROUP=$experiment_name
+
     torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
         -m verl.trainer.fsdp_sft_trainer \
         data.train_files=$HOME/Jack/datasets/igsm/train_$round.parquet \
         data.val_files=$test_files \
         data.prompt_key=extra_info \
         data.response_key=extra_info \
-        data.train_batch_size=128 \
+        data.train_batch_size=64 \
+        data.micro_batch_size_per_gpu=8 \
         optim.lr=5e-5 \
         data.prompt_dict_keys=['full_question'] \
         +data.response_dict_keys=['full_solution'] \
         model.partial_pretrain=$last_round_name \
         model.use_liger=true \
-        trainer.resume_from_checkpoint=true \
+        trainer.resume_from_checkpoint=false \
         trainer.default_local_dir=$save_path/$experiment_name \
         trainer.project_name=igsm-sft \
         trainer.experiment_name=$experiment_name \
         trainer.logger=['console','wandb'] \
         trainer.default_hdfs_dir=null $@ \
+        trainer.total_epochs=1 \
         validation.reward_fn.path="/home/ubuntu/CS839-Project/verl/verl/utils/reward_score/igsm.py" \
-        validation.val_before_train=true \
+        validation.val_before_train=false \
         use_remove_padding=false 
+    
+    python -m verl.trainer.main_generation \
+        trainer.nnodes=1 \
+        trainer.n_gpus_per_node=1 \
+        data.path=$HOME/Jack/datasets/igsm/test_$(($round+1)).parquet \
+        data.prompt_key=prompt \
+        data.n_samples=1 \
+        data.output_path=$HOME/Jack/datasets/igsm/gen/igsm-sft-$model-liger/train_$((round+1)) \
+        model.path=$save_path/$experiment_name \
+        +model.trust_remote_code=True \
+        rollout.temperature=1.0 \
+        rollout.top_k=50 \
+        rollout.top_p=0.7 \
+        rollout.prompt_length=2048 \
+        rollout.response_length=1024 \
+        rollout.tensor_model_parallel_size=1 \
+        rollout.gpu_memory_utilization=1.0
 done
         # trainer.resume_path=$save_path/$experiment_name \

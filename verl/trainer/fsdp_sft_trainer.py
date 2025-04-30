@@ -107,11 +107,11 @@ class FSDPSFTTrainer:
 
         # Initialize the validation generations logger
         self.validation_generations_logger = ValidationGenerationsLogger()
-        
+
         # Check for resuming from checkpoint
         self.global_steps = 0
         self.resume_checkpoint = self._find_latest_checkpoint() if getattr(self.config.trainer, "resume_from_checkpoint", False) else None
-        
+
         self._build_dataloader()
         # build model and optimizer (will load from checkpoint if available)
         self._build_model_optimizer()
@@ -577,7 +577,7 @@ class FSDPSFTTrainer:
                 attention_mask = batch["attention_mask"]
                 # position_ids = batch["position_ids"]
                 # response_ids = batch["response_ids"]
-                response_length = max(batch["response_length"])
+                response_length = int(max(batch["response_length"]))
                 raw_prompts = batch["raw_prompt"]
                 raw_responses = batch["raw_response"]
                 ground_truths = [extract_solution(r) for r in raw_responses]

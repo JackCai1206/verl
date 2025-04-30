@@ -19,10 +19,13 @@ def extract_solution(solution_str):
 def make_map_fn(split):
 
     def process_fn(example, idx):
-        solution = extract_solution(example['solution'])
+        full_solution = example['solution']
+        solution = extract_solution(example.pop('solution'))
         full_question = example['messages'][0]['content']
         full_question += '\n Please output the answer in the format of "ANSWER:\n" + answer'
         example['messages'][0]['content'] = full_question
+        for key in ['problem', 'question']:
+            example.pop(key, None)
         data = {
             "data_source": data_source,
             "prompt": example.pop('messages'),
@@ -35,7 +38,8 @@ def make_map_fn(split):
                 'split': split,
                 'index': idx,
                 'full_question': full_question,
-                'full_solution': example['solution']
+                'full_solution': full_solution,
+                **example
             },
         }
         return data
@@ -55,12 +59,14 @@ if __name__ == '__main__':
     
     train_datasets = []
     test_datasets = []
-    for n in range(1, 12):
+    for n in range(1, len(ds) + 1):
         train_dataset, test_dataset = ds[f'ops_{n}'].train_test_split(test_size=100).values()
+        # train_dataset = train_dataset.map(lambda x: {'ops': n} | x)
+        # test_dataset = test_dataset.map(lambda x: {'ops': n} | x)
         train_datasets.append(train_dataset)
         test_datasets.append(test_dataset)
 
-    for round in range(1, 5):
+    for round in range(1, len(ds) - 4):
         train_dataset = datasets.interleave_datasets(train_datasets[round-1:round + 4], seed=42)
         train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
         print(train_dataset[0])
@@ -71,8 +77,8 @@ if __name__ == '__main__':
             makedirs(args.hdfs_dir)
             copy(src=args.local_dir, dst=args.hdfs_dir)
 
-    for n in range(1, 12):
-        test_dataset = test_datasets[round - 1]
+    for n in range(1, len(ds) + 1):
+        test_dataset = test_datasets[n - 1]
         test_dataset = test_dataset.map(function=make_map_fn('test'), with_indices=True)
 
         test_dataset.to_parquet(os.path.join(args.local_dir, f'test_op_{n}.parquet'))
