@@ -94,24 +94,31 @@ class SFTDataset(Dataset):
             dataframe = pd.read_parquet(parquet_file)
             dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
-        self.prompts = self.dataframe[self.prompt_key]
-        for key in self.prompt_dict_keys:
-            # type(x): pandas.core.series.Series
-            # type(x[0]): numpy.ndarray
-            # type(x[0][0]): dict
-            try:
-                self.prompts = self.prompts.apply(lambda x: series_to_item(x)[key], axis=1)
-            except Exception:
-                print(f"self.prompts={self.prompts}")
-                raise
+        if len(self.prompt_dict_keys) > 0:
+            self.prompts = self.dataframe[self.prompt_key]
+            for key in self.prompt_dict_keys:
+                # type(x): pandas.core.series.Series
+                # type(x[0]): numpy.ndarray
+                # type(x[0][0]): dict
+                try:
+                    self.prompts = self.prompts.apply(lambda x: series_to_item(x)[key], axis=1)
+                except Exception:
+                    print(f"self.prompts={self.prompts}")
+                    raise
+        else:
+            self.prompts = self.dataframe[self.prompt_key[0]]
         self.prompts = self.prompts.tolist()
-        self.responses = self.dataframe[self.response_key]
-        for key in self.response_dict_keys:
-            try:
-                self.responses = self.responses.apply(lambda x: series_to_item(x)[key], axis=1)
-            except Exception:
-                print(f"self.responses={self.responses}")
-                raise
+
+        if len(self.response_dict_keys) > 0:
+            self.responses = self.dataframe[self.response_key]
+            for key in self.response_dict_keys:
+                try:
+                    self.responses = self.responses.apply(lambda x: series_to_item(x)[key], axis=1)
+                except Exception:
+                    print(f"self.responses={self.responses}")
+                    raise
+        else:
+            self.responses = self.dataframe[self.response_key[0]]
         self.responses = self.responses.tolist()
         
         self.extra_info = self.dataframe.get("extra_info", None)
@@ -129,7 +136,10 @@ class SFTDataset(Dataset):
                 response = self.responses[idx]
                 
                 # Apply chat template
-                prompt_chat = [{"role": "user", "content": prompt}]
+                if isinstance(prompt, str):
+                    prompt_chat = [{"role": "user", "content": prompt}]
+                else:
+                    prompt_chat = prompt
                 prompt_chat_str = self.tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
                 response_chat_str = response + self.tokenizer.eos_token
 
@@ -165,7 +175,10 @@ class SFTDataset(Dataset):
         response = self.responses[item]
 
         # Apply chat template
-        prompt_chat = [{"role": "user", "content": prompt}]
+        if isinstance(prompt, str):
+            prompt_chat = [{"role": "user", "content": prompt}]
+        else:
+            prompt_chat = prompt
         prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
         
         if self.validation_mode:
@@ -220,8 +233,8 @@ class SFTDataset(Dataset):
                 "position_ids": position_ids,
                 # "response_ids": response_ids,
                 "response_length": response_length,
-                "raw_prompt": prompt,
-                "raw_response": response,  # Pass the ground truth response for evaluation
+                "raw_prompt": prompt_chat_str,
+                "raw_response": response_chat_str,  # Pass the ground truth response for evaluation
             }
         else:
             # Training mode - original implementation

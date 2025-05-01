@@ -24,6 +24,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 # os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
 from verl.utils.model import compute_position_id_with_mask
+from verl.trainer.fsdp_sft_trainer import find_latest_checkpoint
 
 import pandas as pd
 
@@ -56,6 +57,16 @@ def main_task(config):
     from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
+    
+    # Check if the model path is a directory that might contain checkpoints
+    model_path = config.model.path
+    if os.path.isdir(model_path):
+        # Try to find the latest checkpoint directly in the specified path
+        latest_checkpoint = find_latest_checkpoint(model_path)
+        if latest_checkpoint:
+            print(f"Found latest checkpoint in model path: {latest_checkpoint}")
+            config.model.path = latest_checkpoint
+    
     local_path = copy_to_local(config.model.path)
     from verl.utils import hf_tokenizer
     trust_remote_code = config.data.get('trust_remote_code', False)

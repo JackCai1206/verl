@@ -18,6 +18,11 @@ TODO(zhangchi.usc1992)
 """
 
 import os
+from typing import List
+
+from verl.protocol import DataProto
+from verl.workers.rollout.vllm_rollout import vLLMRollout, vllm_mode
+from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -41,13 +46,14 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
+from vllm import LLM, SamplingParams
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.dataset import SFTDataset
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.fs import copy_to_local
-from verl.utils.fsdp_utils import get_fsdp_wrap_policy, get_init_weight_context_manager, init_fn
+from verl.utils.fsdp_utils import get_fsdp_wrap_policy, get_init_weight_context_manager, init_fn, load_fsdp_model_to_gpu, load_fsdp_optimizer, offload_fsdp_model_to_cpu, offload_fsdp_optimizer
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.utils.ulysses import (
@@ -67,6 +73,13 @@ def extract_step(path):
         return int(match.group(1))
     return None
 
+def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
+    # remove the left padding in the prompt token_id
+    # pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None else self.llm_engine.tokenizer.eos_token_id
+    non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
+    token_ids = prompt_token_ids[non_pad_index:].tolist()
+    return token_ids
+
 
 def convert_to_regular_types(obj):
     """Convert Hydra configs and other special types to regular Python types."""
@@ -81,6 +94,57 @@ def convert_to_regular_types(obj):
     return obj
 
 
+def find_latest_checkpoint(checkpoint_dir, hdfs_dir=None):
+    """Find the latest checkpoint based on step number
+    
+    Args:
+        checkpoint_dir: Local directory to search for checkpoints
+        hdfs_dir: HDFS directory to search for checkpoints (optional)
+        
+    Returns:
+        Path to the latest checkpoint
+    """
+    # Function to find latest checkpoint in a directory
+    def find_latest_in_dir(directory, use_hdfs=False):
+        if use_hdfs:
+            if not hdfs_io.exists(directory):
+                return None
+            checkpoints = hdfs_io.listdir(directory)
+        else:
+            if not os.path.exists(directory):
+                return None
+            checkpoints = os.listdir(directory)
+            
+        steps = []
+        for checkpoint in checkpoints:
+            if checkpoint.startswith("global_step_"):
+                step = extract_step(checkpoint)
+                if step is not None:
+                    steps.append((step, os.path.join(directory, checkpoint)))
+        
+        if not steps:
+            return None
+        
+        # Return the path with the highest step
+        return sorted(steps, key=lambda x: x[0], reverse=True)[0][1]
+    
+    # First check local directory
+    latest_local = find_latest_in_dir(checkpoint_dir)
+    
+    # Then check HDFS if configured
+    latest_hdfs = None
+    if hdfs_dir:
+        latest_hdfs = find_latest_in_dir(hdfs_dir, use_hdfs=True)
+        if latest_hdfs and (latest_local is None or extract_step(latest_hdfs) > extract_step(latest_local)):
+            # Copy from HDFS to local
+            local_path = os.path.join(checkpoint_dir, os.path.basename(latest_hdfs))
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            hdfs_io.copy(latest_hdfs, local_path)
+            return local_path
+    
+    return latest_local
+
+
 class FSDPSFTTrainer:
     def __init__(self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh):
         self.config = config
@@ -89,6 +153,9 @@ class FSDPSFTTrainer:
         self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         # build tokenizer first
         local_model_path = copy_to_local(src=self.config.model.partial_pretrain, verbose=True)
+
+        self._is_offload_param = self.config.validation.get('param_offload', False)
+        self._is_offload_optimizer = self.config.validation.get('optimizer_offload', False)
         from verl.utils import hf_tokenizer
 
         self.tokenizer = hf_tokenizer(local_model_path, trust_remote_code=self.config.model.trust_remote_code)
@@ -126,6 +193,26 @@ class FSDPSFTTrainer:
             if self.resume_checkpoint:
                 print(f"Resuming from checkpoint: {self.resume_checkpoint}")
 
+        if vllm_mode == 'customized':
+            self.rollout = vLLMRollout(actor_module=self.fsdp_model,
+                                    config=self.config.rollout,
+                                    tokenizer=self.tokenizer,
+                                    model_hf_config=self.model_hf_config,)
+        elif vllm_mode == 'spmd':
+            self.rollout = vLLMRollout(model_path=self.model_load_path,
+                                        config=self.config.rollout,
+                                        tokenizer=self.tokenizer,
+                                        model_hf_config=self.model_hf_config,
+                                        device_mesh=self.device_mesh,
+                                        trust_remote_code=self.config.model.trust_remote_code,)
+        # if torch.distributed.get_world_size() == 1:
+        #     self.config.rollout.load_format = 'dummy_hf'
+        self.rollout_sharding_manager = FSDPVLLMShardingManager(module=self.fsdp_model,
+                                                            inference_engine=self.rollout.inference_engine,
+                                                            model_config=self.model_hf_config,
+                                                            full_params=torch.distributed.get_world_size() == 1,
+                                                            device_mesh=self.device_mesh)
+
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
         if self.device_mesh.get_rank() == 0:
@@ -157,7 +244,7 @@ class FSDPSFTTrainer:
         # Create datasets based on the selected class
         # Training dataset - normal mode
         self.train_dataset = dataset_cls(
-            parquet_files=config.data.train_files, 
+            parquet_files=list(config.data.train_files), 
             tokenizer=self.tokenizer, 
             config=config.data,
             validation_mode=False
@@ -228,11 +315,11 @@ class FSDPSFTTrainer:
 
         # Determine model load path - checkpoint if resuming or original model path
         if self.resume_checkpoint and os.path.exists(self.resume_checkpoint):
-            model_load_path = self.resume_checkpoint
+            self.model_load_path = self.resume_checkpoint
             if self.device_mesh.get_rank() == 0:
-                print(f"Loading model weights from checkpoint: {model_load_path}")
+                print(f"Loading model weights from checkpoint: {self.model_load_path}")
         else:
-            model_load_path = copy_to_local(src=self.config.model.partial_pretrain, verbose=True)
+            self.model_load_path = copy_to_local(src=self.config.model.partial_pretrain, verbose=True)
 
         if self.config.model.get("external_lib", None) is not None:
             # This is used to import external_lib into the huggingface systems
@@ -244,19 +331,19 @@ class FSDPSFTTrainer:
 
         trust_remote_code = self.config.model.trust_remote_code
         # load config first
-        config = AutoConfig.from_pretrained(model_load_path, trust_remote_code=trust_remote_code)
+        self.model_hf_config = AutoConfig.from_pretrained(self.model_load_path, trust_remote_code=trust_remote_code)
         if self.config.ulysses_sequence_parallel_size > 1:
             assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
 
         # This may be very large
         init_context = get_init_weight_context_manager(
-            use_meta_tensor=not config.tie_word_embeddings, mesh=self.device_mesh
+            use_meta_tensor=not self.model_hf_config.tie_word_embeddings, mesh=self.device_mesh
         )
 
         with init_context():
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-                model_load_path,
-                config=config,
+                self.model_load_path,
+                config=self.model_hf_config,
                 torch_dtype=torch.float32,
                 attn_implementation="flash_attention_2",
                 trust_remote_code=trust_remote_code,
@@ -452,6 +539,11 @@ class FSDPSFTTrainer:
             return loss
 
     def training_step(self, batch: TensorDict):
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.fsdp_model)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.optimizer, device_id=torch.cuda.current_device())
+
         self.fsdp_model.train()
 
         log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
@@ -499,48 +591,67 @@ class FSDPSFTTrainer:
         return loss
 
     @torch.no_grad()
-    def generate_text(self, input_ids, attention_mask, response_length=128):
+    def generate_text(self, input_ids, attention_mask, position_ids=None, response_length=128):
         """Generate text using the model for validation"""
         self.fsdp_model.eval()
         
         # Set generation parameters from config
-        max_new_tokens = self.config.validation.get("max_new_tokens", response_length * 2)
-        do_sample = self.config.validation.get("do_sample", False)
-        num_beams = self.config.validation.get("num_beams", 1)
-        temperature = self.config.validation.get("temperature", 1.0)
-        top_k = self.config.validation.get("top_k", 50)
-        top_p = self.config.validation.get("top_p", 1.0)
+        # max_new_tokens = self.config.validation.get("max_new_tokens", response_length * 1.5)
+        # do_sample = self.config.validation.get("do_sample", False)
+        # num_beams = self.config.validation.get("num_beams", 1)
+        # temperature = self.config.validation.get("temperature", 1.0)
+        # top_k = self.config.validation.get("top_k", 50)
+        # top_p = self.config.validation.get("top_p", 1.0)
         
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "num_beams": num_beams,
-            "do_sample": do_sample,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-        }
+        # gen_kwargs = {
+        #     "max_new_tokens": max_new_tokens,
+        #     "num_beams": num_beams,
+        #     "do_sample": do_sample,
+        #     "temperature": temperature,
+        #     "top_p": top_p,
+        #     "top_k": top_k,
+        #     "pad_token_id": self.tokenizer.pad_token_id,
+        #     "eos_token_id": self.tokenizer.eos_token_id,
+        # }
 
         # Move inputs to the correct device
         input_ids = input_ids.to(self.device_mesh.device_type)
         attention_mask = attention_mask.to(self.device_mesh.device_type)
+        position_ids = position_ids.to(self.device_mesh.device_type) if position_ids is not None else None
 
         # FSDP summon_full_params context for generation
-        with FSDP.summon_full_params(self.fsdp_model, writeback=False, recurse=False), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            output_sequences = self.fsdp_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=True,
-                **gen_kwargs
-            )
-
-        # Extract just the generated part (excluding prompt)
-        input_length = input_ids.shape[1]
-        generated_sequences = output_sequences[:, input_length:]
+        # with FSDP.summon_full_params(self.fsdp_model, writeback=False, recurse=False), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        #     output_sequences = self.fsdp_model.generate(
+        #         input_ids=input_ids,
+        #         attention_mask=attention_mask,
+        #         use_cache=True,
+        #         **gen_kwargs
+        #     )
         
+        prompts = DataProto.from_dict(
+            {'input_ids': input_ids, 'attention_mask': attention_mask, 'position_ids': position_ids},
+            meta_info={'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id}
+        )
+        self.rollout.config.response_length = int(response_length * 1.5)
+
+        log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+
+        prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+        output = self.rollout.generate_sequences(prompts=prompts)
+        log_gpu_memory_usage('After rollout generation', logger=logger)
+
+        output = self.rollout_sharding_manager.postprocess_data(output)
+
+        output = output.to('cpu')
+
+        # # Extract just the generated part (excluding prompt)
+        # input_length = input_ids.shape[1]
+        # generated_sequences = output_sequences[:, input_length:]
+
         # Convert to text
-        generated_texts = [self.tokenizer.decode(seq, skip_special_tokens=True) for seq in generated_sequences]
+        generated_texts = self.tokenizer.batch_decode(
+            output.batch['responses'], skip_special_tokens=True
+        )
 
         return generated_texts
 
@@ -570,51 +681,58 @@ class FSDPSFTTrainer:
 
         # Aggregate metrics
         aggregated_metrics = {}
-        for val_name, val_dataloader in self.val_dataloader_list.items():
-            for batch in tqdm(val_dataloader, desc=f"Validation ({val_name})", disable=self.device_mesh.get_rank() != 0):
-                # Generate predictions for this batch
-                input_ids = batch["input_ids"]
-                attention_mask = batch["attention_mask"]
-                # position_ids = batch["position_ids"]
-                # response_ids = batch["response_ids"]
-                response_length = int(max(batch["response_length"]))
-                raw_prompts = batch["raw_prompt"]
-                raw_responses = batch["raw_response"]
-                ground_truths = [extract_solution(r) for r in raw_responses]
-                
-                # Run generation
-                generated_texts = self.generate_text(input_ids, attention_mask, response_length)
-                
-                # Collect results
-                all_inputs.extend(raw_prompts)
-                all_predictions.extend(generated_texts)
-                all_ground_truths.extend(ground_truths)
+        with self.rollout_sharding_manager:
+            # after parameters sync with rollout, offload actor model to CPU
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.fsdp_model)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.optimizer)
 
-                # Compute metrics for each example
-                if reward_fn:
-                    for prompt, pred, truth in zip(raw_prompts, generated_texts, ground_truths):
-                        result = reward_fn(pred, truth,
-                            **self.config.validation.reward_fn.get("kwargs", {})
-                        )
-                        rewards.append(result)
-            
-            if reward_fn:
-                # Average reward
-                aggregated_metrics[f"val/{val_name}/reward_mean"] = sum(rewards) / len(rewards)
-                aggregated_metrics[f"val/{val_name}/reward_max"] = max(rewards)
-                aggregated_metrics[f"val/{val_name}/reward_min"] = min(rewards)
+            for val_name, val_dataloader in self.val_dataloader_list.items():
+                for batch in tqdm(val_dataloader, desc=f"Validation ({val_name})", disable=self.device_mesh.get_rank() != 0):
+                    # Generate predictions for this batch
+                    input_ids = batch["input_ids"]
+                    attention_mask = batch["attention_mask"]
+                    position_ids = batch["position_ids"]
+                    # response_ids = batch["response_ids"]
+                    response_length = int(max(batch["response_length"]))
+                    raw_prompts = batch["raw_prompt"]
+                    raw_responses = batch["raw_response"]
+                    ground_truths = [extract_solution(r) for r in raw_responses]
+                    
+                    # Run generation
+                    generated_texts = self.generate_text(input_ids, attention_mask, position_ids, response_length)
+                    
+                    # Collect results
+                    all_inputs.extend(raw_prompts)
+                    all_predictions.extend(generated_texts)
+                    all_ground_truths.extend(ground_truths)
+
+                    # Compute metrics for each example
+                    if reward_fn:
+                        for prompt, pred, truth in zip(raw_prompts, generated_texts, ground_truths):
+                            result = reward_fn(pred, truth,
+                                **self.config.validation.reward_fn.get("kwargs", {})
+                            )
+                            rewards.append(result)
                 
-                # Aggregate other metrics if available
-                # if "extra_info" in all_metrics[0]:
-                #     for key in all_metrics[0]["extra_info"]:
-                #         values = [m["extra_info"][key] for m in all_metrics if key in m["extra_info"]]
-                #         if isinstance(values[0], (int, float)):
-                #             aggregated_metrics[f"val/{key}_mean"] = sum(values) / len(values)
-            
-            # Log example generations
-            self._log_validation_generations(all_inputs, all_predictions, all_ground_truths, 
-                                        rewards if reward_fn else None)
-        
+                if reward_fn:
+                    # Average reward
+                    aggregated_metrics[f"val/{val_name}/reward_mean"] = sum(rewards) / len(rewards)
+                    aggregated_metrics[f"val/{val_name}/reward_max"] = max(rewards)
+                    aggregated_metrics[f"val/{val_name}/reward_min"] = min(rewards)
+                    
+                    # Aggregate other metrics if available
+                    # if "extra_info" in all_metrics[0]:
+                    #     for key in all_metrics[0]["extra_info"]:
+                    #         values = [m["extra_info"][key] for m in all_metrics if key in m["extra_info"]]
+                    #         if isinstance(values[0], (int, float)):
+                    #             aggregated_metrics[f"val/{key}_mean"] = sum(values) / len(values)
+                
+                # Log example generations
+                self._log_validation_generations(all_inputs, all_predictions, all_ground_truths, 
+                                            rewards if reward_fn else None)
+
         return aggregated_metrics
 
     def _log_validation_generations(self, inputs, predictions, ground_truths, rewards=None):
@@ -643,6 +761,8 @@ class FSDPSFTTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def save_checkpoint(self, step):
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.fsdp_model)
         # save checkpoint
         from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
@@ -833,47 +953,8 @@ class FSDPSFTTrainer:
         """Find the latest checkpoint based on step number"""
         checkpoint_dir = self.config.trainer.default_local_dir
         hdfs_dir = getattr(self.config.trainer, "default_hdfs_dir", None)
-        
-        # Function to find latest checkpoint in a directory
-        def find_latest_in_dir(directory, use_hdfs=False):
-            if use_hdfs:
-                if not hdfs_io.exists(directory):
-                    return None
-                checkpoints = hdfs_io.listdir(directory)
-            else:
-                if not os.path.exists(directory):
-                    return None
-                checkpoints = os.listdir(directory)
-                
-            steps = []
-            for checkpoint in checkpoints:
-                if checkpoint.startswith("global_step_"):
-                    step = extract_step(checkpoint)
-                    if step is not None:
-                        steps.append((step, os.path.join(directory, checkpoint)))
-            
-            if not steps:
-                return None
-            
-            # Return the path with the highest step
-            return sorted(steps, key=lambda x: x[0], reverse=True)[0][1]
-        
-        # First check local directory
-        latest_local = find_latest_in_dir(checkpoint_dir)
-        
-        # Then check HDFS if configured
-        latest_hdfs = None
-        if hdfs_dir:
-            latest_hdfs = find_latest_in_dir(hdfs_dir, use_hdfs=True)
-            if latest_hdfs and (latest_local is None or extract_step(latest_hdfs) > extract_step(latest_local)):
-                # Copy from HDFS to local
-                local_path = os.path.join(checkpoint_dir, os.path.basename(latest_hdfs))
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                hdfs_io.copy(latest_hdfs, local_path)
-                return local_path
-        
-        return latest_local
-
+        return find_latest_checkpoint(checkpoint_dir, hdfs_dir)
+    
     def _load_checkpoint_states(self, checkpoint_path):
         """Load optimizer and scheduler states from checkpoint"""
         if self.device_mesh.get_rank() == 0:
@@ -917,7 +998,12 @@ from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 def main(config):
     local_rank, rank, world_size = initialize_global_process_group()
 
-    device_mesh = init_device_mesh(device_type="cuda", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    # device_mesh = init_device_mesh(device_type="cuda", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    infer_tp = config.rollout.tensor_model_parallel_size
+    dp = world_size // infer_tp
+    assert world_size % infer_tp == 0, f'rollout world_size: {world_size} is not divisible by infer_tp: {infer_tp}'
+    device_mesh = init_device_mesh('cuda', mesh_shape=(dp, infer_tp), mesh_dim_names=['dp', 'infer_tp'])
+
     dp_size = world_size // config.ulysses_sequence_parallel_size
     ulysses_device_mesh = init_device_mesh(
         device_type="cuda", mesh_shape=(dp_size, config.ulysses_sequence_parallel_size), mesh_dim_names=("dp", "sp")
@@ -925,6 +1011,6 @@ def main(config):
     trainer = FSDPSFTTrainer(config=config, device_mesh=device_mesh, ulysses_device_mesh=ulysses_device_mesh)
     trainer.fit()
 
-
 if __name__ == "__main__":
     main()
+    torch.distributed.destroy_process_group()

@@ -51,17 +51,47 @@ validation:
   test_freq: 0  # How often to run validation (in steps)
   val_before_train: false  # Whether to run validation before training starts
   # max_new_tokens: null  # Maximum length for generated outputs
-  num_beams: 1  # Number of beams for beam search
-  do_sample: true  # Whether to use sampling
-  temperature: 0.7  # Sampling temperature
-  top_p: 0.8  # Nucleus sampling parameter
-  top_k: 20  # Top-k sampling parameter
+  # num_beams: 1  # Number of beams for beam search
+  # do_sample: true  # Whether to use sampling
+  # temperature: 0.7  # Sampling temperature
+  # top_p: 0.8  # Nucleus sampling parameter
+  # top_k: 20  # Top-k sampling parameter
+  param_offload: True
+  optimzer_offload: True
 
   reward_fn:
     path: "path/to/reward_functions.py"  # Replace with actual path
     # kwargs:
     #   # Additional arguments if needed
     #   check_reasoning: true  # Example custom parameter
+
+rollout:
+  name: vllm
+  temperature: 0.7
+  top_k: 20 # 0 for hf rollout, -1 for vllm rollout
+  top_p: 0.7
+  prompt_length: 1536
+  response_length: 512
+  # for vllm rollout
+  dtype: bfloat16 # should align with FSDP
+  gpu_memory_utilization: 0.5
+  ignore_eos: False
+  enforce_eager: True
+  free_cache_engine: True
+  load_format: auto
+  tensor_model_parallel_size: 1
+  max_num_batched_tokens: 8192
+  max_model_len: null
+  max_num_seqs: 1024
+  log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
+  log_prob_micro_batch_size_per_gpu: 8
+  # for fire vllm rollout
+  use_fire_sampling: False # enable FIRE https://arxiv.org/abs/2410.21236
+  # for hf rollout
+  do_sample: True
+  disable_log_stats: True
+  enable_chunked_prefill: True
+  n: 1
 
 ulysses_sequence_parallel_size: 1
 use_remove_padding: False

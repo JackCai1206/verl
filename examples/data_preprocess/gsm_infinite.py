@@ -29,6 +29,7 @@ def make_map_fn(split):
         data = {
             "data_source": data_source,
             "prompt": example.pop('messages'),
+            "response": full_solution,
             "ability": "math",
             "reward_model": {
                 "style": "rule",
@@ -37,8 +38,6 @@ def make_map_fn(split):
             "extra_info": {
                 'split': split,
                 'index': idx,
-                'full_question': full_question,
-                'full_solution': full_solution,
                 **example
             },
         }
