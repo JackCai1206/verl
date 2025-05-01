@@ -31,7 +31,11 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     solution = extract_solution_set(solution_str)
     if solution is None:
         return 0
-    return 1 if ground == solution else 0
+    
+    num_wrong = len(solution - ground)
+    num_right = len(solution.intersection(ground))
+    raw_score = min(1, (num_right - num_wrong) / len(ground))
+    return max(raw_score, 0.1)
 
 # add a row to each data item that represents a unique id
 def process_fn(split, example, idx):
