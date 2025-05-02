@@ -748,10 +748,15 @@ class RayPPOTrainer(object):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
         print(f'Load from checkpoint folder: {global_step_folder}')
+        
         # set global step
-        self.global_steps = int(global_step_folder.split('global_step_')[-1])
-
-        print(f'Setting global step to {self.global_steps}')
+        if self.config.trainer.resume_global != "false":
+            self.global_steps = int(global_step_folder.split('global_step_')[-1])
+            print(f'Setting global step to {self.global_steps}')
+        else:
+            self.global_steps = 0
+            print(f'Setting global step to {self.global_steps} via new config flag!')
+        
         print(f'Resuming from {global_step_folder}')
 
         actor_path = os.path.join(global_step_folder, 'actor')
