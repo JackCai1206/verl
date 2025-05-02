@@ -56,6 +56,7 @@ def get_custom_reward_fn(config):
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
+    print("HELLO THERE, PPO", config)
     run_ppo(config)
 
 
