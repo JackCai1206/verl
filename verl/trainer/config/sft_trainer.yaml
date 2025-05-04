@@ -56,8 +56,8 @@ validation:
   temperature: 0.7  # Sampling temperature
   top_p: 0.8  # Nucleus sampling parameter
   top_k: 20  # Top-k sampling parameter
-  param_offload: True
-  optimzer_offload: True
+  param_offload: False
+  optimzer_offload: False
 
   reward_fn:
     path: "path/to/reward_functions.py"  # Replace with actual path

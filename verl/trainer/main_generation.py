@@ -14,17 +14,19 @@
 """
 Generate responses given a dataset of prompts
 """
+import re
 import ray
 import numpy as np
 import hydra
 import os
+from collections import Counter
 
 os.environ['NCCL_DEBUG'] = 'WARN'
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 # os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
+from verl.utils import hdfs_io
 from verl.utils.model import compute_position_id_with_mask
-from verl.trainer.fsdp_sft_trainer import find_latest_checkpoint
 
 import pandas as pd
 
@@ -36,6 +38,62 @@ from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.utils.hdfs_io import makedirs
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 
+
+def extract_step(path):
+    match = re.search(r"global_step_(\d+)", path)
+    if match:
+        return int(match.group(1))
+    return None
+
+def find_latest_checkpoint(checkpoint_dir, hdfs_dir=None):
+    """Find the latest checkpoint based on step number
+    
+    Args:
+        checkpoint_dir: Local directory to search for checkpoints
+        hdfs_dir: HDFS directory to search for checkpoints (optional)
+        
+    Returns:
+        Path to the latest checkpoint
+    """
+    # Function to find latest checkpoint in a directory
+    def find_latest_in_dir(directory, use_hdfs=False):
+        if use_hdfs:
+            if not hdfs_io.exists(directory):
+                return None
+            checkpoints = hdfs_io.listdir(directory)
+        else:
+            if not os.path.exists(directory):
+                return None
+            checkpoints = os.listdir(directory)
+            
+        steps = []
+        for checkpoint in checkpoints:
+            if checkpoint.startswith("global_step_"):
+                step = extract_step(checkpoint)
+                if step is not None:
+                    steps.append((step, os.path.join(directory, checkpoint)))
+        
+        if not steps:
+            return None
+        
+        # Return the path with the highest step
+        return sorted(steps, key=lambda x: x[0], reverse=True)[0][1]
+    
+    # First check local directory
+    latest_local = find_latest_in_dir(checkpoint_dir)
+    
+    # Then check HDFS if configured
+    latest_hdfs = None
+    if hdfs_dir:
+        latest_hdfs = find_latest_in_dir(hdfs_dir, use_hdfs=True)
+        if latest_hdfs and (latest_local is None or extract_step(latest_hdfs) > extract_step(latest_local)):
+            # Copy from HDFS to local
+            local_path = os.path.join(checkpoint_dir, os.path.basename(latest_hdfs))
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            hdfs_io.copy(latest_hdfs, local_path)
+            return local_path
+    
+    return latest_local
 
 @hydra.main(config_path='config', config_name='generation', version_base=None)
 def main(config):
@@ -78,7 +136,6 @@ def main_task(config):
     # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
     dataset = pd.read_parquet(config.data.path)
     chat_lst = dataset[config.data.prompt_key].tolist()
-
     chat_lst = [chat.tolist() for chat in chat_lst]
 
     tokenizer.padding_side = 'left'
@@ -96,6 +153,11 @@ def main_task(config):
     dispatch_dp_size = wg.world_size
     num_batch = -(-total_samples // config_batch_size)
     output_lst = [[] for _ in range(config.data.n_samples)]
+    
+    extract_fn = None
+    if config.custom_reward_function.path is not None:
+        from verl.utils.import_utils import load_extern_type
+        extract_fn = load_extern_type(config.custom_reward_function.path, 'extract_solution')
 
     for batch_idx in range(num_batch):
         print(f'[{batch_idx+1}/{num_batch}] Start to process.')
@@ -150,9 +212,25 @@ def main_task(config):
     # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
     output_lst = np.array(output_lst, dtype=object)
     output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
+    
+    if config.data.self_consistency:
+        for i, output_batch in enumerate(output_lst):
+            if extract_fn is not None: 
+                solutions = [str(extract_fn(output_text)) for output_text in output_batch]
+            else:
+                solutions = output_batch
+            # self-consistency: select the response with most common solution
+            # Create counter to find most common solution
+            solution_counter = Counter(solutions)
+            most_common_solution = solution_counter.most_common(1)[0][0]
+
+            # Find the original response text that produced the most common solution
+            most_common_index = solutions.index(most_common_solution)
+            most_common_response = output_batch[most_common_index]
+            output_lst[i] = [most_common_response]
 
     # add to the data frame
-    dataset[f'responses'] = output_lst
+    dataset['responses'] = output_lst
 
     # write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)

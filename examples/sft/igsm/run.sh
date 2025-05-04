@@ -18,13 +18,21 @@ model=Qwen/Qwen2.5-0.5B-Instruct
 # model=Qwen/Qwen2.5-7B-Instruct
 # model=Qwen/Qwen2.5-Math-1.5B-Instruct
 
-for round in {1..10}; do
-    experiment_name=igsm-sft-$model-liger-round_$round-no_label
+# Function to generate experiment name based on model and round
+get_experiment_name() {
+    local model_name=$1
+    local round_num=$2
+    echo "igsm-sft-$model_name-liger-round_$round_num-no_label"
+}
+
+for round in {2..10}; do
+    experiment_name=$(get_experiment_name "$model" "$round")
     if [ "$round" -eq 1 ]; then
         last_round_name=$model
     else
         prev_round=$((round-1))
-        last_round_name=$save_path/igsm-sft-$model-liger-round_$prev_round
+        last_round_experiment_name=$(get_experiment_name "$model" "$prev_round")
+        last_round_name=$save_path/$last_round_experiment_name
         # Find the latest checkpoint folder with the biggest global step
         last_round_name=$(find "$last_round_name" -maxdepth 1 -type d -name "global_step_*" | sort -t_ -k3 -n | tail -n 1)
         if [ -z "$last_round_name" ]; then
@@ -76,7 +84,7 @@ for round in {1..10}; do
         optim.lr=5e-5 \
         model.partial_pretrain=$last_round_name \
         model.use_liger=true \
-        trainer.resume_from_checkpoint=true \
+        trainer.resume_from_checkpoint=false \
         trainer.default_local_dir=$save_path/$experiment_name \
         trainer.project_name=igsm-sft \
         trainer.experiment_name=$experiment_name \
@@ -93,7 +101,7 @@ for round in {1..10}; do
         data.path=$HOME/Jack/datasets/igsm/train_op_$(($round+5)).parquet \
         data.prompt_key=prompt \
         data.n_samples=1 \
-        data.output_path=$HOME/Jack/datasets/igsm/gen/igsm-sft-$model-liger/train_op_$((round+5)).parquet \
+        data.output_path=$HOME/Jack/datasets/igsm/gen/$experiment_name/train_op_$((round+5)).parquet \
         model.path=$save_path/$experiment_name \
         +model.trust_remote_code=True \
         rollout.temperature=1.0 \
