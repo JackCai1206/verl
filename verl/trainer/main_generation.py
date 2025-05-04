@@ -216,7 +216,12 @@ def main_task(config):
     if config.data.self_consistency:
         for i, output_batch in enumerate(output_lst):
             if extract_fn is not None: 
-                solutions = [str(extract_fn(output_text)) for output_text in output_batch]
+                solutions = []
+                for output_text in output_batch:
+                    sol = extract_fn(output_text)
+                    if isinstance(sol, set):
+                        sol = sorted(list(sol))
+                    solutions.append(sol)
             else:
                 solutions = output_batch
             # self-consistency: select the response with most common solution
