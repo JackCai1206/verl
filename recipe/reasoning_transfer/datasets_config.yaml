@@ -1,0 +1,50 @@
+# - name: "aime_test"
+#   path: "gneubig/aime-1983-2024"
+#   split: "train"
+#   question_column: "Question"
+#   answer_column: "Answer"
+#   extra_columns: 
+#     "year": "Year"
+#     "problem_number": "Problem Number"
+#     "part": "Part"
+
+# - name: "big_math_train"
+#   path: "SynthLabsAI/Big-Math-RL-Verified"
+#   split: "train"
+#   question_column: "problem" 
+#   answer_column: "answer"
+#   extra_columns:
+#     "source": "source"
+#     "domain": "domain"
+#     "solve_rate": "llama8b_solve_rate"
+
+- path: "HuggingFaceH4/MATH-500"
+  question_column: "problem"
+  answer_column: "answer"
+  # extra_columns:
+  #   "subject": "subject"
+  #   "level": "level"
+  #   "unique_id": "unique_id"
+  #   "solution": "solution"
+
+- path: "MathArena/aime_2025"
+  question_column: "problem"
+  answer_column: "answer"
+  # extra_columns:
+  #   "problem_idx": "problem_idx"
+  #   "problem_type": "problem_type"
+
+- path: "HuggingFaceH4/aime_2024"
+  question_column: "problem"
+  answer_column: "answer"
+  # extra_columns:
+  #   "id": "id"
+  #   "solution": "solution"
+  #   "url": "url"
+  #   "year": "year"
+
+- path: "jackcai1206/sudoku_easy2hard"
+  question_column: "quizzes"
+  answer_column: "solutions"
+  extra_columns:
+    "clues": "clue_numbers"
