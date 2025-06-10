@@ -16,6 +16,7 @@ Preprocess the AIME datasets to parquet format
 """
 
 import argparse
+from functools import partial
 import os
 import yaml
 
@@ -31,7 +32,7 @@ def extract_solution(solution_str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="/home/zcai75/data/verl")
+    parser.add_argument("--local_dir", default=os.path.join(os.path.expanduser("~"), "Jack/data/verl"))
     parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--datasets_config", default="recipe/reasoning_transfer/datasets_config.yaml", type=str,
                        help="JSON string or file path with dataset configurations")
@@ -97,7 +98,7 @@ if __name__ == "__main__":
                         extra_info[new_key] = example[orig_col]
             
             example = {
-                "data_source": dataset_name,
+                "data_source": dataset_name + '_clue_' + str(example['clue_numbers']),
                 "prompt": [{"role": "user", "content": question}],
                 "ability": "math",
                 "reward_model": {"style": "sudoku", "ground_truth": answer},
@@ -113,13 +114,15 @@ if __name__ == "__main__":
         answer_col = config.get("answer_column", "")
         extra_cols = config.get("extra_columns", {})
         splits = config.get("split", None)
-        
+
         dataset_dir = os.path.join(args.local_dir, dataset_path.replace("/", "_"))
         
-        # Skip if dataset already exists
-        if os.path.exists(dataset_dir):
-            print(f"Dataset {dataset_path} already exists at {dataset_dir}, skipping...", flush=True)
-            continue
+        # # Skip if dataset already exists
+        # if os.path.exists(dataset_dir) and all(
+        #     os.path.exists(os.path.join(dataset_dir, f"{split}.parquet")) for split in (splits if isinstance(splits, list) else [splits])
+        # ):
+        #     print(f"Dataset {dataset_path} already exists at {dataset_dir}, skipping...", flush=True)
+        #     continue
         
         print(f"Loading {dataset_path}...", flush=True)
         full_dataset = datasets.load_dataset(dataset_path, trust_remote_code=True)
@@ -131,11 +134,23 @@ if __name__ == "__main__":
         else:
             splits_to_process = splits if isinstance(splits, list) else [splits]
         
+        if dataset_path == "jackcai1206/sudoku_easy2hard":
+            num_classes = 81-17
+            full_dataset['train'] = full_dataset['train'].cast_column(
+                'clue_numbers', datasets.ClassLabel(num_classes=num_classes, names=[str(i) for i in range(17, 81)])
+            )
+            full_dataset = full_dataset['train'].train_test_split(
+                train_size=num_classes * 1000,
+                test_size=num_classes * 5,
+                stratify_by_column='clue_numbers',
+                shuffle=True
+            )
+
         for split_name in splits_to_process:
             print(f"Processing split: {split_name}", flush=True)
             dataset = full_dataset[split_name]
             dataset = dataset.map(function=make_map_fn(dataset_path, question_col, answer_col, extra_cols), 
-                                 with_indices=True, remove_columns=[question_col, answer_col] + list(extra_cols.values()))
+                                 with_indices=True, remove_columns=[question_col, answer_col] + list(extra_cols.values()), num_proc=16)
             dataset.to_parquet(os.path.join(dataset_dir, f"{split_name}.parquet"))
 
     if args.hdfs_dir is not None:
