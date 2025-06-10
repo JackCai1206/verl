@@ -145,6 +145,7 @@ if __name__ == "__main__":
                 stratify_by_column='clue_numbers',
                 shuffle=True
             )
+            splits_to_process = ['train', 'test']
 
         for split_name in splits_to_process:
             print(f"Processing split: {split_name}", flush=True)

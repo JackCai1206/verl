@@ -8,7 +8,7 @@ model_name="Qwen/Qwen3-0.6B"
 experiment_name=$model_name
 
 train_files="['$HOME/Jack/data/verl/jackcai1206_sudoku_easy2hard/train.parquet']"
-val_files="['$HOME/Jack/data/verl/HuggingFaceH4_aime_2024/train.parquet', '$HOME/Jack/data/verl/HuggingFaceH4_MATH-500/test.parquet', '$HOME/Jack/data/verl/MathArena_aime_2025/train.parquet']"
+val_files="['$HOME/Jack/data/verl/jackcai1206_sudoku_easy2hard/test.parquet', '$HOME/Jack/data/verl/HuggingFaceH4_aime_2024/train.parquet', '$HOME/Jack/data/verl/HuggingFaceH4_MATH-500/test.parquet', '$HOME/Jack/data/verl/MathArena_aime_2025/train.parquet']"
 
 tp_size=1
 sp_size=1
@@ -19,7 +19,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files="$val_files" \
     data.train_batch_size=1024 \
     data.max_prompt_length=650 \
-    data.max_response_length=8192 \
+    data.max_response_length=4096 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=16 \
     data.truncation='error' \
@@ -39,13 +39,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${tp_size} \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
+    actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \

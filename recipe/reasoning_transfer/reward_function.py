@@ -1,9 +1,9 @@
-def compute_score(data_source, solution_str, ground_truth, extra_info=None):
+def compute_score(data_source: str, solution_str, ground_truth, extra_info=None):
     if data_source in ["HuggingFaceH4/MATH-500", "MathArena/aime_2025", "HuggingFaceH4/aime_2024"]:
         from recipe.r1.tasks import math
 
         return math.compute_score(solution_str, ground_truth)
-    elif data_source == "jackcai1206/sudoku_easy2hard":
+    elif data_source.startswith("jackcai1206/sudoku_easy2hard"):
         from verl.utils.reward_score.math import last_boxed_only_string, remove_boxed
         
         def parse_sudoku_answer(solution_str):
