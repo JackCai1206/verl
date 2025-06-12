@@ -73,14 +73,18 @@ if __name__ == "__main__":
             # Convert flattened list to indexed format
             puzzle_flat = example[question_col]
             
-            # Create indexed list format
-            grid_str = "Sudoku Puzzle (81 cells, rows 1-9, columns A-I):\n"
-            for i in range(81):
-                row = (i // 9) + 1
-                col = chr(ord('A') + (i % 9))
-                cell_value = '_' if puzzle_flat[i] == 0 else str(puzzle_flat[i])
-                grid_str += f"{col}{row}: {cell_value}\n"
+            # Create 9x9 grid format
+            grid_str_lines = ["Sudoku Puzzle:"] # Title
+            for r in range(9):
+                row_str_parts = []
+                for c in range(9):
+                    cell_value = '_' if puzzle_flat[r * 9 + c] == 0 else str(puzzle_flat[r * 9 + c])
+                    row_str_parts.append(cell_value)
+                grid_str_lines.append(" ".join(row_str_parts))
             
+            # Correcting to use actual newlines for the question string construction
+            grid_str = "\n".join(grid_str_lines) 
+
             question = f"{grid_str}\n" + \
                       "Solve this Sudoku puzzle step by step. Fill in the empty cells (marked with '_') with digits 1-9 such that:\n" + \
                       "- Each row contains all digits 1-9 exactly once\n" + \
@@ -88,7 +92,7 @@ if __name__ == "__main__":
                       "- Each 3x3 box contains all digits 1-9 exactly once\n\n" + \
                       "You can reference cells by their position (e.g., A1, B2, I9). " + \
                       "Provide your reasoning step by step, then put your final answer as a list of 81 numbers (reading left-to-right, top-to-bottom) within \\boxed{}."
-            
+
             answer = str(example[answer_col])
 
             extra_info = {"index": idx}

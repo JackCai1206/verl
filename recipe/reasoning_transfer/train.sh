@@ -4,8 +4,8 @@ set -x
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 # export RAY_DEBUG_POST_MORTEM=1
 
-# model_name="Qwen/Qwen3-0.6B"
-model_name="meta-llama/Llama-3.2-3B-Instruct"
+# model_name="Qwen/Qwen3-1.7B"
+# model_name="meta-llama/Llama-3.2-3B-Instruct"
 experiment_name=$model_name
 
 train_files="['$HOME/Jack/data/verl/jackcai1206_sudoku_easy2hard/train.parquet']"
