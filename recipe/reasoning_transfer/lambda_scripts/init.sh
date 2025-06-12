@@ -27,3 +27,6 @@ sudo apt-get update
 sudo apt-get -y install cudnn9-cuda-12
 uv pip install --no-build-isolation transformer_engine[pytorch]
 uv pip install megatron-core
+
+# Allow login from freyr
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKKc20MGaVC5TKeF/bkpmPIbyD31oBqDiO94fcMSkiE2 jackcai1206@gmail.com" >> ~/.ssh/authorized_keys
