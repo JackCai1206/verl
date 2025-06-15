@@ -48,3 +48,13 @@
   answer_column: "solutions"
   extra_columns:
     "clues": "clue_numbers"
+    "puzzle_string": "quizzes"
+
+- path: "jackcai1206/killer-sudoku-puzzles"
+  question_column: "puzzle_string"
+  answer_column: "first_solution"
+  extra_columns:
+    "puzzle_string": "puzzle_string"
+    "difficulty": "difficulty"
+    "num_cages": "num_cages"
+    "backtrack_calls": "backtrack_calls"

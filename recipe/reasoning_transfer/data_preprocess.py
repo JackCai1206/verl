@@ -25,6 +25,37 @@ import datasets
 from verl.utils.hdfs_io import copy, makedirs
 from verl.utils.reward_score.math import last_boxed_only_string, remove_boxed
 
+# Import killer sudoku parsing function
+try:
+    from recipe.reasoning_transfer.killer_sudoku import parse_puzzle_string
+except ImportError:
+    # Fallback if import fails
+    def parse_puzzle_string(puzzle_str):
+        from collections import defaultdict
+        lines = puzzle_str.strip().splitlines()
+        if len(lines) != 2 or len(lines[0]) != 81:
+            raise ValueError("Invalid puzzle string format")
+        seq = lines[0]
+        cage_id_map = [['']*9 for _ in range(9)]
+        for idx, ch in enumerate(seq):
+            r, c = divmod(idx, 9)
+            cage_id_map[r][c] = ch
+        
+        cage_cells = defaultdict(list)
+        for r in range(9):
+            for c in range(9):
+                letter = cage_id_map[r][c]
+                cage_cells[letter].append((r,c))
+        
+        cage_sums = {}
+        for token in lines[1].split(';'):
+            if not token:
+                continue
+            letter, sval = token.split(':')
+            cage_sums[letter] = int(sval)
+        
+        return cage_id_map, cage_cells, cage_sums
+
 
 def extract_solution(solution_str):
     return remove_boxed(last_boxed_only_string(solution_str))
@@ -90,7 +121,6 @@ if __name__ == "__main__":
                       "- Each row contains all digits 1-9 exactly once\n" + \
                       "- Each column contains all digits 1-9 exactly once\n" + \
                       "- Each 3x3 box contains all digits 1-9 exactly once\n\n" + \
-                      "You can reference cells by their position (e.g., A1, B2, I9). " + \
                       "Provide your reasoning step by step, then put your final answer as a list of 81 numbers (reading left-to-right, top-to-bottom) within \\boxed{}."
 
             answer = str(example[answer_col])
@@ -110,7 +140,66 @@ if __name__ == "__main__":
             }
             return example
 
-        return process_fn if dataset_name != "jackcai1206/sudoku_easy2hard" else process_fn_sudoku
+        def process_fn_killer_sudoku(example, idx):
+            # Parse the puzzle string format from killer sudoku
+            puzzle_str = example[question_col]
+            cage_id_map, cage_cells, cage_sums = parse_puzzle_string(puzzle_str)
+
+            # Create 9x9 grid showing cage structure
+            grid_str_lines = ["Killer Sudoku Puzzle:"]
+            for r in range(9):
+                row_str_parts = []
+                for c in range(9):
+                    cage_id = cage_id_map[r][c]
+                    row_str_parts.append(cage_id)
+                grid_str_lines.append(" ".join(row_str_parts))
+            
+            grid_str = "\n".join(grid_str_lines)
+            
+            # Format cage sums for display
+            cage_sums_str = "Cage sums:\n"
+            for cage_id in sorted(cage_sums.keys()):
+                cage_sums_str += f"Cage {cage_id}: {cage_sums[cage_id]}\n"
+
+            question = f"{grid_str}\n\n{cage_sums_str}\n" + \
+                      "Solve this Killer Sudoku puzzle step by step. Fill in all cells with digits 1-9 such that:\n" + \
+                      "- Each row contains all digits 1-9 exactly once\n" + \
+                      "- Each column contains all digits 1-9 exactly once\n" + \
+                      "- Each 3x3 box contains all digits 1-9 exactly once\n" + \
+                      "- Each cage (group of cells marked with the same letter) sums to the specified total\n" + \
+                      "- No digit repeats within a cage\n\n" + \
+                      "Provide your reasoning step by step, then put your final answer as a list of 81 numbers (reading left-to-right, top-to-bottom) within \\boxed{}."
+
+            # Convert solution from 9x9 grid to flat list
+            solution_grid = example[answer_col]
+            if isinstance(solution_grid[0], list):
+                # If it's a 9x9 grid, flatten it
+                answer = str([cell for row in solution_grid for cell in row])
+            else:
+                # If it's already flat, use as is
+                answer = str(solution_grid)
+
+            extra_info = {"index": idx}
+            if extra_cols:
+                for new_key, orig_col in extra_cols.items():
+                    if orig_col in example:
+                        extra_info[new_key] = example[orig_col]
+            
+            example = {
+                "data_source": dataset_name + '_diff_' + str(example.get('difficulty', 'unknown')),
+                "prompt": [{"role": "user", "content": question}],
+                "ability": "math",
+                "reward_model": {"style": "killer_sudoku", "ground_truth": answer},
+                "extra_info": extra_info,
+            }
+            return example
+
+        if dataset_name == "jackcai1206/sudoku_easy2hard":
+            return process_fn_sudoku
+        elif dataset_name == "jackcai1206/killer-sudoku-puzzles":
+            return process_fn_killer_sudoku
+        else:
+            return process_fn
 
     for config in datasets_config:
         dataset_path = config["path"]

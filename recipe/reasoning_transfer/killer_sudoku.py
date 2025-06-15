@@ -2,6 +2,9 @@ import random
 import itertools
 from collections import defaultdict
 import matplotlib.pyplot as plt
+from multiprocessing import Pool, cpu_count
+from datasets import Dataset
+import os
 
 # ------------------------------------------------------------------------------
 # 1) Generate a full 9×9 Sudoku grid by simple backtracking + random digit order
@@ -181,13 +184,14 @@ def compute_cage_sums(solution_grid, cage_cells):
 # 4) A backtracking solver + counter to check uniqueness (up to 2 solutions)
 # ------------------------------------------------------------------------------
 
-def solve_and_count(cage_cells, cage_sums, limit=2):
+def solve_and_count(cage_cells, cage_sums, limit=2, max_backtrack_calls_limit=1000000): # Added max_backtrack_calls_limit
     """
     Attempts to count how many solutions (≤ limit) exist that satisfy:
       • Standard Sudoku constraints (rows/cols/3×3)
       • Each cage’s sum, with no repeated digit in a cage.
-    Stops early if count ≥ limit. Returns a tuple:
-        (solution_count, backtrack_calls)
+    Stops early if count ≥ limit or if backtrack_calls ≥ max_backtrack_calls_limit. # Updated docstring
+    Returns a tuple:
+        (solution_count, backtrack_calls, solutions_found_list) # Updated docstring
     """
 
     # 1) Build a fresh 9×9 “cage_id_map” so every cell knows its letter.
@@ -211,6 +215,7 @@ def solve_and_count(cage_cells, cage_sums, limit=2):
 
     solution_count = 0
     backtrack_calls = 0
+    solutions_found_list = [] # Added to store solutions
 
     # 5) Precompute for each cage: the list of its member coordinates
     #    (This is just a local alias; we already have cage_cells)
@@ -227,9 +232,14 @@ def solve_and_count(cage_cells, cage_sums, limit=2):
         if solution_count >= limit:
             return
 
+        # If we've exceeded the backtrack call limit, stop immediately
+        if backtrack_calls >= max_backtrack_calls_limit: # Added this check
+            return
+
         # If we filled all 81 cells, we have a complete solution
         if idx == 81:
             solution_count += 1
+            solutions_found_list.append([row[:] for row in grid]) # Store a copy of the solution
             return
 
         r, c = all_positions[idx]
@@ -308,6 +318,8 @@ def solve_and_count(cage_cells, cage_sums, limit=2):
 
             if solution_count >= limit:
                 return
+            if backtrack_calls >= max_backtrack_calls_limit: # Added this check here as well for early exit after undo
+                return
 
         # If no digit 1..9 worked, this branch fails and backtracks
         # print(f"Backtracking at idx={idx} (r={r}, c={c}), no valid digit found")
@@ -315,7 +327,7 @@ def solve_and_count(cage_cells, cage_sums, limit=2):
 
     # Kick off recursion
     backtrack(0)
-    return solution_count, backtrack_calls
+    return solution_count, backtrack_calls, solutions_found_list # Return solutions
 
 # ------------------------------------------------------------------------------
 # 5) Combine everything: generate until unique solution is found
@@ -323,30 +335,31 @@ def solve_and_count(cage_cells, cage_sums, limit=2):
 
 def generate_killer(difficulty, max_tries=100):
     """
-    Tries up to max_tries times to: 
+    Tries up to max_tries times to:
       1) generate a complete sudoku
       2) partition into cages
       3) compute sums
-      4) test uniqueness (exactly 1 solution)
-    Returns: puzzle_str (2‐line string), or raises RuntimeError if none found.
-    
+      4) test uniqueness (up to 2 solutions)
+    Returns: puzzle_str (2‐line string), list of solutions, or raises RuntimeError if none found. # Updated docstring
+
     puzzle_str format:
-      Line 1: 81 characters (row‐major) giving cage ID 'A'.. 
+      Line 1: 81 characters (row‐major) giving cage ID 'A'..
       Line 2: semicolon-separated "ID:sum" pairs (e.g. A:7;B:13;C:4;…)
     """
     for attempt in range(max_tries):
         sol = generate_complete_sudoku()
         cage_id_map_local, cage_cells = partition_no_dup_cages(sol, difficulty)
         cage_sums = compute_cage_sums(sol, cage_cells)
-        count, bt_calls = solve_and_count(cage_cells, cage_sums, limit=2)
-        print(f"Attempt {attempt+1}: {count} solutions found, {bt_calls} backtrack calls")
-        if count == 1:
+        # Pass the max_backtrack_calls_limit to solve_and_count
+        count, bt_calls, solutions = solve_and_count(cage_cells, cage_sums, limit=2) # Get solutions
+        # print(f"Attempt {attempt+1}: {count} solutions found, {bt_calls} backtrack calls")
+        if 0 < count < 3: # allow up to 2 solutions (unique is too strict)
             # Build string representation
             line1 = ''.join(cage_id_map_local[r][c] for r in range(9) for c in range(9))
             sums_list = [f"{letter}:{cage_sums[letter]}" for letter in sorted(cage_sums)]
             line2 = ';'.join(sums_list)
-            return line1 + "\n" + line2
-    raise RuntimeError(f"Failed to generate a unique‐solution puzzle in {max_tries} tries")
+            return line1 + "\n" + line2, solutions # Return solutions
+    raise RuntimeError(f"Failed to generate a puzzle in {max_tries} tries")
 
 
 # ------------------------------------------------------------------------------
@@ -449,12 +462,139 @@ def visualize(cage_id_map, cage_sums, figsize=(6,6)):
 
 if __name__ == "__main__":
     # Example: generate a medium‐difficulty puzzle (difficulty = 3)
-    puzzle_str = generate_killer(difficulty=5, max_tries=100)
-    print("Puzzle string (2 lines):")
-    print(puzzle_str)
-    
-    # Parse it back
-    cage_id_map, cage_cells, cage_sums = parse_puzzle_string(puzzle_str)
-    
-    # Visualize
-    visualize(cage_id_map, cage_sums)
+    # for difficulty in range(1, 6):
+    #     print(f"Generating a killer Sudoku puzzle with difficulty {difficulty}...")
+
+    #     puzzle_str, solutions = generate_killer(difficulty=difficulty, max_tries=100) # Get solutions
+    #     print("Puzzle string (2 lines):")
+    #     print(puzzle_str)
+
+    #     if solutions:
+    #         print("\\nFound solution(s):")
+    #         # Print the first solution
+    #         first_solution = solutions[0]
+    #         for row in first_solution:
+    #             print(" ".join(map(str, row)))
+    #         if len(solutions) > 1:
+    #             print(f"...and {len(solutions)-1} other solution(s).")
+    #     else:
+    #         print("No solution found by the solver (this shouldn't happen if generate_killer succeeded).")
+
+
+    #     # Parse it back
+    #     cage_id_map, cage_cells, cage_sums = parse_puzzle_string(puzzle_str)
+
+    #     # Visualize
+    #     visualize(cage_id_map, cage_sums)
+
+    def puzzle_generator(start_id, end_id, total_puzzles=50000, num_processes=16):
+        """
+        Generator function for creating puzzles with Dataset.from_generator
+        """
+        print(f"Generating puzzles from ID {start_id} to {end_id}...")
+        start_id = start_id[0]  # Extract single start_id from list
+        end_id = end_id[0]      # Extract single end_id from list
+
+        difficulties = [2, 3, 4]
+        puzzles_per_difficulty = total_puzzles // num_processes // len(difficulties)
+
+        puzzle_id = start_id
+
+        # Generate puzzles for each difficulty
+        for difficulty in difficulties:
+            for _ in range(puzzles_per_difficulty):
+                puzzle_str, solutions = generate_killer(difficulty=difficulty, max_tries=50)
+                assert solutions, "No solutions found for generated puzzle"
+                
+                # Parse to get cage information
+                cage_id_map, cage_cells, cage_sums = parse_puzzle_string(puzzle_str)
+                
+                # Count number of cages
+                num_cages = len(cage_cells)
+                
+                # Get backtrack calls by re-solving
+                count, bt_calls, _ = solve_and_count(cage_cells, cage_sums, limit=1)
+                
+                yield {
+                    'puzzle_id': puzzle_id,
+                    'difficulty': difficulty,
+                    'puzzle_string': puzzle_str,
+                    'num_cages': num_cages,
+                    'backtrack_calls': bt_calls,
+                    'solution_count': count,
+                    'first_solution': solutions[0] if solutions else None
+                }
+                
+                puzzle_id += 1
+                
+                if puzzle_id >= end_id:
+                    print(f"Reached end_id {end_id}, stopping generation.")
+                    return
+
+    # Generate 1,000 puzzles across difficulties 1-4 using Dataset.from_generator
+    total_puzzles = 1100
+    print(f"Generating {total_puzzles} killer Sudoku puzzles using Dataset.from_generator...")
+
+    # Use Dataset.from_generator with native multiprocessing
+    num_processes = min(cpu_count(), 16)  # Use up to 16 cores
+    print(f"Using {num_processes} processes...")
+
+    dataset = Dataset.from_generator(
+        puzzle_generator,
+        gen_kwargs={
+            'start_id': [i * (total_puzzles // num_processes) for i in range(num_processes)],
+            'end_id': [(i + 1) * (total_puzzles // num_processes) for i in range(num_processes)],
+            'total_puzzles': total_puzzles,
+            'num_processes': num_processes
+        },
+        num_proc=num_processes
+    )
+
+    dataset.train_test_split(test_size=0.1, seed=42, stratify_by_column='difficulty')  # Split into train/test sets
+
+    print(f"Successfully generated {len(dataset)} puzzles")
+
+    if len(dataset) > 0:
+        # Upload dataset to Hugging Face
+        repo_name = "jackcai1206/killer-sudoku-puzzles"
+        print(f"Uploading dataset to Hugging Face as '{repo_name}'...")
+        
+        try:
+            dataset.push_to_hub(
+                repo_name,
+                private=False,  # Set to True if you want a private dataset
+                commit_message="Upload killer sudoku puzzle dataset with 50k puzzles"
+            )
+            print(f"Dataset successfully uploaded to: https://huggingface.co/datasets/{repo_name}")
+        except Exception as e:
+            print(f"Failed to upload to Hugging Face: {e}")
+            # print("Falling back to local save...")
+            # # Fallback to local save
+            # output_dir = "/home/zcai75/github/verl/recipe/reasoning_transfer/killer_sudoku_dataset"
+            # os.makedirs(output_dir, exist_ok=True)
+            # dataset.save_to_disk(output_dir)
+            # print(f"Dataset saved locally to {output_dir}")
+        
+        print(f"Dataset info:")
+        print(f"  Total puzzles: {len(dataset)}")
+        print(f"  Columns: {dataset.column_names}")
+        
+        # Print some statistics
+        difficulty_counts = {}
+        for diff in dataset['difficulty']:
+            difficulty_counts[diff] = difficulty_counts.get(diff, 0) + 1
+        
+        print(f"  Difficulty distribution: {difficulty_counts}")
+        print(f"  Average cages: {sum(dataset['num_cages']) / len(dataset):.2f}")
+        print(f"  Average backtrack calls: {sum(dataset['backtrack_calls']) / len(dataset):.2f}")
+        
+        # Show a sample puzzle
+        if len(dataset) > 0:
+            print(f"\nSample puzzle (ID {dataset[0]['puzzle_id']}):")
+            print(f"Difficulty: {dataset[0]['difficulty']}")
+            print(f"Number of cages: {dataset[0]['num_cages']}")
+            print(f"Backtrack calls: {dataset[0]['backtrack_calls']}")
+            print("Puzzle string:")
+            print(dataset[0]['puzzle_string'])
+    else:
+        print("No puzzles were successfully generated!")

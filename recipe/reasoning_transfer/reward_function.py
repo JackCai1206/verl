@@ -3,7 +3,7 @@ def compute_score(data_source: str, solution_str, ground_truth, extra_info=None)
         from recipe.r1.tasks import math
 
         return math.compute_score(solution_str, ground_truth)
-    elif data_source.startswith("jackcai1206/sudoku_easy2hard"):
+    elif 'jackcai1206/sudoku_easy2hard' in data_source:
         from verl.utils.reward_score.math import last_boxed_only_string, remove_boxed
         
         def parse_sudoku_answer(solution_str):
@@ -21,9 +21,15 @@ def compute_score(data_source: str, solution_str, ground_truth, extra_info=None)
             except:
                 return None
         
-        def compute_sudoku_score(grid):
+        def compute_sudoku_score(grid, original_puzzle=None):
             if len(grid) != 81:
                 return 0.0
+            
+            # Verify original clues are preserved
+            if original_puzzle is not None:
+                for i in range(81):
+                    if original_puzzle[i] != 0 and grid[i] != original_puzzle[i]:
+                        return 0.0
             
             sudoku = []
             for i in range(9):
@@ -68,6 +74,11 @@ def compute_score(data_source: str, solution_str, ground_truth, extra_info=None)
             except:
                 return 0.0
         
+        # Extract original puzzle from extra_info
+        original_puzzle = None
+        if extra_info and 'puzzle_string' in extra_info:
+            original_puzzle = extra_info['puzzle_string']
+        
         boxed_content = last_boxed_only_string(solution_str)
         has_boxed = boxed_content is not None
         
@@ -79,7 +90,7 @@ def compute_score(data_source: str, solution_str, ground_truth, extra_info=None)
         if predicted_grid == ground_truth:
             return 1.0
         
-        return compute_sudoku_score(predicted_grid)
+        return compute_sudoku_score(predicted_grid, original_puzzle)
     else:
         raise ValueError(f"Unknown data source: {data_source}")
 
