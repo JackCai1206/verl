@@ -41,3 +41,6 @@ uv pip install megatron-core
 echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKKc20MGaVC5TKeF/bkpmPIbyD31oBqDiO94fcMSkiE2 jackcai1206@gmail.com" >> ~/.ssh/authorized_keys
 
 wandb login $WANDB_API_KEY
+
+git config --global user.name "jackcai1206"
+git config --global user.email "jackcai1206@gmail.com"
