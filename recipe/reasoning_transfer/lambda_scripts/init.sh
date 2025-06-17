@@ -1,6 +1,16 @@
+if ! command -v uv &> /dev/null; then
+    echo "Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    # export PATH="$HOME/.local/bin:$PATH"
+else
+    echo "uv is already installed."
+fi
+
+uv venv --python=python3.10
+
 source .venv/bin/activate
 python -m ensurepip
-# uv pip install torch torchvision torchaudio
+uv pip install torch torchvision torchaudio
 # uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 --python-version 3.10 --only-binary=:all:
 
 uv pip install wheel
@@ -17,12 +27,11 @@ uv pip install -e .
 
 uv pip install jupyter ipykernel matplotlib
 
-uv pip install hf_transfer
-
-
+uv pip install hf_transfer math_verify
 
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-# sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+rm cuda-keyring_1.1-1_all.deb
 sudo apt-get update
 sudo apt-get -y install cudnn9-cuda-12
 uv pip install --no-build-isolation transformer_engine[pytorch]
@@ -30,3 +39,5 @@ uv pip install megatron-core
 
 # Allow login from freyr
 echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKKc20MGaVC5TKeF/bkpmPIbyD31oBqDiO94fcMSkiE2 jackcai1206@gmail.com" >> ~/.ssh/authorized_keys
+
+wandb login $WANDB_API_KEY

@@ -109,7 +109,7 @@ if __name__ == "__main__":
             for r in range(9):
                 row_str_parts = []
                 for c in range(9):
-                    cell_value = '_' if puzzle_flat[r * 9 + c] == 0 else str(puzzle_flat[r * 9 + c])
+                    cell_value = '_' if str(puzzle_flat[r * 9 + c]) == '0' else str(puzzle_flat[r * 9 + c])
                     row_str_parts.append(cell_value)
                 grid_str_lines.append(" ".join(row_str_parts))
             
@@ -130,7 +130,7 @@ if __name__ == "__main__":
                 for new_key, orig_col in extra_cols.items():
                     if orig_col in example:
                         extra_info[new_key] = example[orig_col]
-            
+
             example = {
                 "data_source": dataset_name + '_clue_' + str(example['clue_numbers']),
                 "prompt": [{"role": "user", "content": question}],
