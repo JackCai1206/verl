@@ -20,7 +20,7 @@ defaults:
 
   # data: trainer/config/data/legacy_data.yaml
   - data@data: legacy_data
-  - classifier_data@classifier_data: legacy_data
+  - data@classifier_data: legacy_data
 
   # Reference model config.
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.

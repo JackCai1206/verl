@@ -94,7 +94,7 @@ class DynamicGenDataset(RLHFDataset):
                 + " must inherit from {abs_cls}"
             )
 
-        self.data_generator = datagen_cls(config.datagen)
+        self.data_generator = datagen_cls(config.datagen, self)
         self.on_batch_end()
 
     def append_dataframe(self, new_dataframe: datasets.Dataset):
@@ -103,7 +103,7 @@ class DynamicGenDataset(RLHFDataset):
 
         logger.info(f"new dataset len: {len(self.dataframe)}")
 
-    def on_batch_end(self, batch: DataProto) -> None:
+    def on_batch_end(self, batch: DataProto=None) -> None:
         """
         Generate data using the provided data generation strategy.
         Note: This method is intended to change the dataset after each training batch.

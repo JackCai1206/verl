@@ -5,7 +5,6 @@ import datasets
 from torch.utils.data import Dataset
 from random import random
 from verl.utils.reward_score import math
-from recipe.gas.utils import build_classifier_prompt
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
 from verl import DataProto
@@ -27,7 +26,8 @@ def build_classifier_prompt(prompt, answer1, answer2):
 {answer2}
 </answer2>
 """
-    return [{'content': prompt_str, 'role': 'user'}], gt
+    return [{'content': prompt_str, 'role': 'user'}], str(gt)
+    # return prompt_str, str(gt)
 
 class ClassifierDataGenerator(AbstractDataGenerator):
     """
@@ -36,24 +36,32 @@ class ClassifierDataGenerator(AbstractDataGenerator):
     """
 
     dataset: Optional[Dataset] = None
-    def __init__(self, config: DictConfig = None):
+    def __init__(self, config: DictConfig = None, dataset: Optional[Dataset] = None):
         super().__init__(config)
+        self.batch_data = None
+        self.dataset = dataset
 
     def build_classifier_batch(self, gen_batch: DataProto, batch: DataProto) -> None:
-        prompt_str = gen_batch.non_tensor_batch['raw_prompt']
+        prompt_str = [p[0]['content'] for p in gen_batch.non_tensor_batch['raw_prompt']]
         gt = [x['ground_truth'] for x in batch.non_tensor_batch['reward_model']]
         ans = [math.remove_boxed(math.last_boxed_only_string(x['response'])) for x in batch.non_tensor_batch['extra_info']]
         messages = []
         classifier_gt = []
         for p, g, a in zip(prompt_str, gt, ans):
             msg, label = build_classifier_prompt(p, g, a)
-            messages.extend(msg)
-            classifier_gt.append(label)
+            messages.append(msg)
+            classifier_gt.append({'ground_truth': label})
 
         self.batch_data = datasets.Dataset.from_dict({
             'prompt': messages,
-            'ground_truth': classifier_gt
+            'reward_model': classifier_gt,
+            'data_source': [x + '_classifier' for x in batch.non_tensor_batch['data_source']],
+            'ability': ['other'] * len(messages),
+            'extra_info': [{}] * len(messages),
         })
+
+        if len(self.dataset.dataframe) == 0:
+            self.dataset.dataframe = self.batch_data
 
         # # Prepare the inputs like in rl_dataset.py
         # model_inputs = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, return_tensors="pt")
@@ -82,5 +90,5 @@ class ClassifierDataGenerator(AbstractDataGenerator):
 
     def generate(self, dataset: Dataset) -> datasets.Dataset:
         if not self.batch_data:
-            raise ValueError("No batch data available to generate from.")
+            return datasets.Dataset.from_dict({})
         return self.batch_data

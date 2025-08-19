@@ -1,21 +1,21 @@
 set -x
 
-
+WANDB_PROJECT=GAS
 python3 -m recipe.gas.main_gas \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/char_count/rl/train.parquet \
     data.val_files=$HOME/data/char_count/rl/test.parquet \
     data.train_batch_size=128 \
-    data.max_prompt_length=128 \
-    data.max_response_length=128 \
+    data.max_prompt_length=256 \
+    data.max_response_length=256 \
     data.filter_overlong_prompts=False \
     data.truncation='error' \
     data.return_raw_chat=True \
     classifier_data.datagen.path=recipe/gas/classifier_datagen.py \
     classifier_data.datagen.name=ClassifierDataGenerator \
-    classifier_data.train_batch_size=128 \
-    classifier_data.max_prompt_length=128 \
-    classifier_data.max_response_length=128 \
+    classifier_data.train_batch_size=1024 \
+    classifier_data.max_prompt_length=256 \
+    classifier_data.max_response_length=256 \
     classifier_data.filter_overlong_prompts=False \
     classifier_data.truncation='error' \
     classifier_data.return_raw_chat=True \
@@ -34,19 +34,20 @@ python3 -m recipe.gas.main_gas \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","tensorboard"]' \
+    trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_example' \
     trainer.experiment_name='smol135m_grpo' \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=2 \
+    trainer.rollout_data_dir=./recipe/gas/rollout_generations \
     custom_reward_function.path=recipe/char_count/reward_function.py \
     custom_reward_function.name=char_count_reward_function

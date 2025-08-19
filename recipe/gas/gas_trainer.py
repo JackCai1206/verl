@@ -37,7 +37,6 @@ from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from recipe.gas.main_gas import create_rl_dataset
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -205,20 +204,23 @@ def compute_advantage(
         data.batch["returns"] = returns
     return data
 
+def gen_reward_fn(reward_tensor: torch.Tensor) -> torch.Tensor:
+    return 1 - reward_tensor
 
 class GASTrainer(RayPPOTrainer):
     def __init__(self, config, collate_fn, train_sampler, **kwargs):
         super().__init__(config, **kwargs)
+        from recipe.gas.main_gas import create_rl_dataset
+
         self.classifier_dataset = create_rl_dataset(
             [], self.config.classifier_data, self.tokenizer, self.processor
         )
 
-        if train_sampler is None:
-            train_sampler = create_rl_sampler(self.config.classifier_data, self.classifier_dataset)
+        classifier_data_sampler = create_rl_sampler(self.config.classifier_data, self.classifier_dataset)
         if collate_fn is None:
             from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
             collate_fn = default_collate_fn
-
+ 
         num_workers = self.config.classifier_data["dataloader_num_workers"]
         self.classifier_dataloader = StatefulDataLoader(
             dataset=self.classifier_dataset,
@@ -226,7 +228,7 @@ class GASTrainer(RayPPOTrainer):
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
-            sampler=train_sampler,
+            sampler=classifier_data_sampler,
         )
 
     def fit(self):
@@ -350,6 +352,44 @@ class GASTrainer(RayPPOTrainer):
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # Classifier rollout --------------------------------------------------------------------------------------------
+                    self.classifier_dataset.data_generator.build_classifier_batch(gen_batch, batch)
+                    classifier_batch_dict = next(self.classifier_dataloader.__iter__())
+                    classifier_batch: DataProto = DataProto.from_single_dict(classifier_batch_dict)
+                    gen_classifier_batch = classifier_batch.pop(
+                        batch_keys=batch_keys_to_pop,
+                        non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                    )
+                    max_tokens = self.config.classifier_data.get('max_response_length', self.config.data.max_response_length)
+                    gen_classifier_batch.meta_info["sampling_params"] = {'n': 1, 'max_tokens': max_tokens}
+                    with marked_timer("gen_classifier", timing_raw, color="red"):
+                        if not self.async_rollout_mode:
+                            gen_batch_classifier_output = self.actor_rollout_wg.generate_sequences(gen_classifier_batch)
+                        else:
+                            gen_batch_classifier_output = self.async_rollout_manager.generate_sequences(gen_classifier_batch)
+                        timing_raw.update(gen_batch_classifier_output.meta_info["timing"])
+                        gen_batch_classifier_output.meta_info.pop("timing", None)
+                    classifier_batch = classifier_batch.union(gen_batch_classifier_output)
+                    classifier_batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
+                    # ---------------------------------------------------------------------------------------------------------------
+
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        # compute reward model score
+                        if self.use_rm:
+                            reward_tensor = self.rm_wg.compute_rm_score(classifier_batch)
+                            classifier_batch = classifier_batch.union(reward_tensor)
+
+                        if self.config.reward_model.launch_reward_fn_async:
+                            future_reward = compute_reward_async.remote(data=classifier_batch, reward_fn=self.reward_fn)
+                        else:
+                            reward_tensor, reward_extra_infos_dict = compute_reward(classifier_batch, self.reward_fn)
+
+                        gen_reward_tensor = gen_reward_fn(reward_tensor)
+                        reward_tensor = torch.cat((reward_tensor, gen_reward_tensor), dim=0)
+
+                    batch = DataProto.concat([batch, classifier_batch])
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -362,29 +402,6 @@ class GASTrainer(RayPPOTrainer):
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                    # Classifier rollout
-                    self.classifier_dataset.datagen.create_classifier_batch(gen_batch, batch)
-                    classifier_batch = next(self.classifier_dataloader)
-                    with marked_timer("gen_classifier", timing_raw, color="red"):
-                        breakpoint()
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(classifier_batch)
-                        else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(classifier_batch)
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
-
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -495,14 +512,21 @@ class GASTrainer(RayPPOTrainer):
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            sample_gts = [
+                                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                                for item in batch
+                            ]
+
                             if "request_id" in batch.non_tensor_batch:
                                 reward_extra_infos_dict.setdefault(
                                     "request_id",
                                     batch.non_tensor_batch["request_id"].tolist(),
                                 )
+
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
+                                gts=sample_gts,
                                 scores=scores,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,

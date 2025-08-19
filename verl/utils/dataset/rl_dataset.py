@@ -128,12 +128,15 @@ class RLHFDataset(Dataset):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
 
     def _read_files_and_tokenize(self):
-        dataframes = []
-        for parquet_file in self.data_files:
-            # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
-            dataframes.append(dataframe)
-        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+        if len(self.data_files) > 0:
+            dataframes = []
+            for parquet_file in self.data_files:
+                # read parquet files and cache
+                dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+                dataframes.append(dataframe)
+            self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+        else:
+            self.dataframe = datasets.Dataset.from_dict({})
 
         print(f"dataset len: {len(self.dataframe)}")
 
